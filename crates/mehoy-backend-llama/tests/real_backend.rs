@@ -123,7 +123,12 @@ async fn the_backend_is_never_told_to_bind_a_routable_address() {
     // argument construction cannot quietly expose the backend.
     let Some(backend) = backend() else { return };
     let channel = mehoy_backend_llama::BackendChannel::reserve().expect("channel reserves");
-    let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel);
+    let file = mehoy_backend_llama::SecretFile::create(
+        &std::env::temp_dir().join("mehoy-backend-test"),
+        channel.secret(),
+    )
+    .expect("secret file is creatable");
+    let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel, &file);
 
     assert!(channel.is_loopback());
     let host_index = args
@@ -131,8 +136,12 @@ async fn the_backend_is_never_told_to_bind_a_routable_address() {
         .position(|arg| arg == "--host")
         .expect("--host is passed");
     assert_eq!(args[host_index + 1], "127.0.0.1");
-    assert!(args.contains(&"--api-key".to_owned()));
+    assert!(args.contains(&"--api-key-file".to_owned()));
     assert!(args.contains(&"--no-webui".to_owned()));
+    assert!(
+        !args.iter().any(|arg| arg == channel.secret().expose()),
+        "the credential must never appear in the process arguments, which other          local accounts can read"
+    );
 }
 
 #[tokio::test]
@@ -231,4 +240,142 @@ fn a_real_backend_does_not_survive_the_abrupt_death_of_its_owner() {
         "llama-server {backend_pid} survived the abrupt death of its owner, \
          leaving a backend holding accelerator memory with nothing to reclaim it"
     );
+}
+
+/// Starts a model-less backend on a private channel and runs `body` against it.
+///
+/// Model-less mode stays listening without loading anything, which is enough to
+/// exercise the credential boundary.
+async fn with_running_backend<F, Fut>(body: F)
+where
+    F: FnOnce(mehoy_backend_llama::BackendChannel) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let Some(backend) = backend() else { return };
+    let channel = mehoy_backend_llama::BackendChannel::reserve().expect("channel reserves");
+
+    // The credential is delivered by file, the same way the production start path
+    // does it. Testing a different delivery mechanism would validate a path the
+    // runtime does not use.
+    let secret_file = mehoy_backend_llama::SecretFile::create(
+        &std::env::temp_dir().join("mehoy-backend-test"),
+        channel.secret(),
+    )
+    .expect("secret file is creatable");
+
+    let spec = mehoy_core::worker::WorkerSpec {
+        id: worker_id(),
+        program: backend.executable().to_path_buf(),
+        args: vec![
+            "--host".to_owned(),
+            channel.host(),
+            "--port".to_owned(),
+            channel.port().to_string(),
+            "--api-key-file".to_owned(),
+            secret_file.path().display().to_string(),
+            "--no-webui".to_owned(),
+        ],
+        deadlines: Deadlines {
+            startup: Duration::from_secs(30),
+            shutdown: Duration::from_secs(5),
+            health: Duration::from_secs(5),
+        },
+        capture_lines: mehoy_core::worker::log::DEFAULT_CAPTURE_LINES,
+    };
+
+    let supervisor = mehoy_core::worker::ProcessWorker;
+    let mut handle = supervisor.spawn(spec).await.expect("backend starts");
+
+    // Wait for the listener rather than assuming it is immediate.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut listening = false;
+    while std::time::Instant::now() < deadline {
+        if matches!(
+            mehoy_backend_llama::health::probe(&channel).await,
+            Ok(mehoy_backend_llama::StartupPhase::BackendReady)
+        ) {
+            listening = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        listening,
+        "backend never started listening; output:\n{}",
+        handle.log().render()
+    );
+
+    body(channel).await;
+
+    let _ = supervisor.shutdown(&mut handle).await;
+}
+
+#[tokio::test]
+async fn the_backend_credential_is_enforced_not_merely_configured() {
+    // The backend logs that it registered an API key, which proves configuration
+    // and nothing about enforcement. This proves enforcement, against a path
+    // measured to require a credential.
+    //
+    // The health endpoint is deliberately not used: it answers 200 with no
+    // credential at all on this build, so an enforcement test written against it
+    // would pass while proving nothing.
+    with_running_backend(|channel| async move {
+        use mehoy_backend_llama::health;
+
+        let unprotected = health::status_without_credential(&channel, health::HEALTH_PATH)
+            .await
+            .expect("health answers");
+        assert_eq!(
+            unprotected.as_u16(),
+            200,
+            "health is expected to be unauthenticated on this build; if that has \
+             changed, the credential test should move to it"
+        );
+
+        let without = health::status_without_credential(&channel, health::PROPS_PATH)
+            .await
+            .expect("the protected path answers");
+        assert_eq!(
+            without.as_u16(),
+            401,
+            "the path used for the credential check must actually require one, \
+             otherwise this test proves nothing"
+        );
+
+        let accepted = health::probe_credential(&channel)
+            .await
+            .expect("the credential check completes");
+        assert_eq!(
+            accepted,
+            mehoy_backend_llama::CredentialState::Accepted,
+            "the backend refused the runtime's own credential"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wrong_credential_is_refused_by_the_backend() {
+    // The other half of enforcement: the correct credential being accepted is only
+    // meaningful if an incorrect one is refused.
+    with_running_backend(|channel| async move {
+        use mehoy_backend_llama::{BackendChannel, ChannelSecret, CredentialState, health};
+
+        let wrong = BackendChannel::at(
+            channel.address(),
+            ChannelSecret::generate().expect("generates a different secret"),
+        );
+        assert_ne!(wrong.secret().expose(), channel.secret().expose());
+
+        let refused = health::probe_credential(&wrong)
+            .await
+            .expect("the credential check completes");
+        match refused {
+            CredentialState::Refused { status } => assert_eq!(status, 401),
+            CredentialState::Accepted => {
+                panic!("the backend accepted a credential it was never given")
+            }
+        }
+    })
+    .await;
 }

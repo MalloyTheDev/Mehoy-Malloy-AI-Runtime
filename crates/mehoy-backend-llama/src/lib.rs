@@ -22,8 +22,8 @@ pub mod channel;
 pub mod health;
 pub mod identity;
 
-pub use channel::{BackendChannel, ChannelSecret};
-pub use health::{Readiness, StartupPhase};
+pub use channel::{BackendChannel, ChannelSecret, SecretFile};
+pub use health::{CredentialState, Readiness, StartupPhase};
 pub use identity::{BackendFamily, BackendIdentity};
 
 use std::fmt;
@@ -38,6 +38,14 @@ use mehoy_core::worker::{
 
 /// Environment variable naming the backend executable.
 pub const EXECUTABLE_ENV: &str = "MEHOY_LLAMA_SERVER";
+
+/// Where per-worker credential files are written.
+///
+/// The system temporary directory is per-user on the platforms targeted here, and
+/// the file itself is created owner-only regardless.
+fn secret_directory() -> PathBuf {
+    std::env::temp_dir().join("mehoy-backend")
+}
 
 /// How many layers to place on an accelerator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +250,12 @@ impl LlamaCppBackend {
     /// Separated from spawning so the security-relevant flags can be asserted
     /// directly, without starting a process or loading a model.
     #[must_use]
-    pub fn command_line(&self, spec: &LlamaCppWorkerSpec, channel: &BackendChannel) -> Vec<String> {
+    pub fn command_line(
+        &self,
+        spec: &LlamaCppWorkerSpec,
+        channel: &BackendChannel,
+        secret_file: &SecretFile,
+    ) -> Vec<String> {
         let mut args = vec![
             "--model".to_owned(),
             spec.model_path.display().to_string(),
@@ -251,9 +264,11 @@ impl LlamaCppBackend {
             channel.host(),
             "--port".to_owned(),
             channel.port().to_string(),
-            // Requires the per-worker secret on every request.
-            "--api-key".to_owned(),
-            channel.secret().expose().to_owned(),
+            // The credential is passed by file, never as an argument. Process
+            // arguments are readable by other local accounts, which would put the
+            // secret in reach of every user on the machine.
+            "--api-key-file".to_owned(),
+            secret_file.path().display().to_string(),
             // The backend is private runtime plumbing, not a user-facing surface.
             "--no-webui".to_owned(),
         ];
@@ -294,11 +309,15 @@ impl LlamaCppBackend {
         let channel = BackendChannel::reserve().map_err(BackendError::Channel)?;
         debug_assert!(channel.is_loopback(), "backend channel must be loopback");
 
+        // Kept alive until the backend has started and read it, then removed.
+        let secret_file = SecretFile::create(&secret_directory(), channel.secret())
+            .map_err(BackendError::Channel)?;
+
         let supervisor = ProcessWorker;
         let worker_spec = WorkerSpec {
             id,
             program: self.executable.clone(),
-            args: self.command_line(spec, &channel),
+            args: self.command_line(spec, &channel, &secret_file),
             deadlines: spec.deadlines,
             capture_lines: DEFAULT_CAPTURE_LINES,
         };
@@ -325,12 +344,38 @@ impl LlamaCppBackend {
             .await;
 
         match ready {
-            Ok(_) => Ok(RunningBackend {
-                handle,
-                channel,
-                identity,
-                readiness: Readiness::BackendReady,
-            }),
+            Ok(_) => {
+                // The health endpoint is not authenticated on the builds measured, so
+                // reaching it proves the backend is serving and nothing about whether
+                // the runtime can actually talk to it. Without this check a
+                // misconfigured secret would produce a backend reported as ready that
+                // rejects the first real request. ADR-0005 requires a refused
+                // credential to be terminal, which is only possible if it is tested.
+                match health::probe_credential(&channel).await {
+                    Ok(CredentialState::Accepted) => Ok(RunningBackend {
+                        handle,
+                        channel,
+                        identity,
+                        readiness: Readiness::BackendReady,
+                    }),
+                    Ok(CredentialState::Refused { status }) => {
+                        let _ = ProcessWorker.shutdown(&mut handle).await;
+                        Err(BackendError::Rejected {
+                            detail: format!(
+                                "the backend refused the runtime's own credential with status                                  {status}; it is serving but unusable"
+                            ),
+                        })
+                    }
+                    Err(err) => {
+                        let _ = ProcessWorker.shutdown(&mut handle).await;
+                        Err(BackendError::Rejected {
+                            detail: format!(
+                                "cannot confirm the backend accepts its credential: {err}"
+                            ),
+                        })
+                    }
+                }
+            }
             Err(source) => {
                 handle.flush_output().await;
                 let output = handle.log().render();
@@ -413,6 +458,14 @@ mod tests {
         BackendChannel::reserve().expect("reserves")
     }
 
+    fn secret_file(channel: &BackendChannel) -> SecretFile {
+        SecretFile::create(
+            &std::env::temp_dir().join("mehoy-backend-test"),
+            channel.secret(),
+        )
+        .expect("secret file is creatable")
+    }
+
     #[test]
     fn a_missing_executable_is_reported_before_anything_is_spawned() {
         let err = LlamaCppBackend::new("definitely-not-a-real-llama-server")
@@ -429,7 +482,8 @@ mod tests {
             executable: PathBuf::from("llama-server"),
         };
         let channel = channel();
-        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel);
+        let file = secret_file(&channel);
+        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel, &file);
 
         let host = args
             .iter()
@@ -452,14 +506,19 @@ mod tests {
             executable: PathBuf::from("llama-server"),
         };
         let channel = channel();
-        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel);
+        let file = secret_file(&channel);
+        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel, &file);
 
-        let key = args
-            .iter()
-            .position(|arg| arg == "--api-key")
-            .map(|index| args[index + 1].clone())
-            .expect("--api-key is passed");
-        assert_eq!(key, channel.secret().expose());
+        // The credential is passed by file. Process arguments are readable by other
+        // local accounts, so a secret placed there would be visible machine-wide.
+        assert!(
+            args.contains(&"--api-key-file".to_owned()),
+            "the credential must be passed by file: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == channel.secret().expose()),
+            "the credential leaked into the process arguments"
+        );
         assert!(
             args.contains(&"--no-webui".to_owned()),
             "the backend is private plumbing, not a user surface: {args:?}"
@@ -472,7 +531,8 @@ mod tests {
             executable: PathBuf::from("llama-server"),
         };
         let channel = channel();
-        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel);
+        let file = secret_file(&channel);
+        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel, &file);
         let port: u16 = args
             .iter()
             .position(|arg| arg == "--port")
@@ -489,7 +549,9 @@ mod tests {
         let backend = LlamaCppBackend {
             executable: PathBuf::from("llama-server"),
         };
-        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel());
+        let channel = channel();
+        let file = secret_file(&channel);
+        let args = backend.command_line(&LlamaCppWorkerSpec::new("model.gguf"), &channel, &file);
         assert!(!args.contains(&"--ctx-size".to_owned()));
         assert!(!args.contains(&"--n-gpu-layers".to_owned()));
     }
@@ -504,7 +566,9 @@ mod tests {
             gpu_layers: Some(GpuLayerPolicy::Layers(24)),
             ..LlamaCppWorkerSpec::new("model.gguf")
         };
-        let args = backend.command_line(&spec, &channel());
+        let channel = channel();
+        let file = secret_file(&channel);
+        let args = backend.command_line(&spec, &channel, &file);
         let value_after = |flag: &str| {
             args.iter()
                 .position(|arg| arg == flag)
@@ -523,7 +587,9 @@ mod tests {
             gpu_layers: Some(GpuLayerPolicy::CpuOnly),
             ..LlamaCppWorkerSpec::new("model.gguf")
         };
-        let args = backend.command_line(&spec, &channel());
+        let channel = channel();
+        let file = secret_file(&channel);
+        let args = backend.command_line(&spec, &channel, &file);
         let index = args
             .iter()
             .position(|arg| arg == "--n-gpu-layers")

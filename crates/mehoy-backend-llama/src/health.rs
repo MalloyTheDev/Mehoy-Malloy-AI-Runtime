@@ -28,7 +28,20 @@ use tokio::net::TcpStream;
 use crate::channel::BackendChannel;
 
 /// The health path exposed by the backend.
+///
+/// Measured behaviour on llama.cpp build 9010: this endpoint is **not**
+/// authenticated. It answers `200` with no credential, with a wrong credential, and
+/// with the correct one. It reports whether the backend is serving and nothing
+/// about whether the runtime can actually talk to it.
 pub const HEALTH_PATH: &str = "/health";
+
+/// A path that is genuinely credential-protected.
+///
+/// Measured on the same build: `401` without a credential, `200` with the correct
+/// one. Because [`HEALTH_PATH`] ignores credentials entirely, readiness cannot be
+/// established from it alone. A misconfigured secret would otherwise produce a
+/// backend that reports itself ready and then rejects the first real request.
+pub const PROPS_PATH: &str = "/props";
 
 /// How long a single health request may take.
 const REQUEST_BUDGET: Duration = Duration::from_secs(5);
@@ -45,6 +58,15 @@ pub enum Readiness {
     /// Nothing sets this yet. It exists so that the weaker claim above is never
     /// mistaken for it.
     InferenceVerified,
+}
+
+/// Whether the runtime's credential is actually accepted by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialState {
+    /// The backend accepted the runtime's credential.
+    Accepted,
+    /// The backend refused it. Waiting will not help.
+    Refused { status: u16 },
 }
 
 /// Where a backend is in its startup.
@@ -135,7 +157,55 @@ pub async fn probe(channel: &BackendChannel) -> Result<StartupPhase, HealthError
     }
 }
 
+/// Confirms the backend actually enforces, and accepts, the runtime's credential.
+///
+/// This is the difference between a credential being configured and a credential
+/// being enforced. It is checked against a path that is known to require one.
+///
+/// # Errors
+///
+/// Returns [`HealthError::Transport`] when the request cannot be completed.
+pub async fn probe_credential(channel: &BackendChannel) -> Result<CredentialState, HealthError> {
+    let status = tokio::time::timeout(REQUEST_BUDGET, status_of(channel, PROPS_PATH, true))
+        .await
+        .map_err(|_| HealthError::Transport("credential check timed out".to_owned()))??;
+
+    Ok(if status.is_success() {
+        CredentialState::Accepted
+    } else {
+        CredentialState::Refused {
+            status: status.as_u16(),
+        }
+    })
+}
+
+/// Asks a path what it answers without any credential.
+///
+/// Used to establish that a path is protected at all, so a test cannot pass by
+/// checking an endpoint that never required a credential.
+///
+/// # Errors
+///
+/// Returns [`HealthError::Transport`] when the request cannot be completed.
+pub async fn status_without_credential(
+    channel: &BackendChannel,
+    path: &str,
+) -> Result<StatusCode, HealthError> {
+    tokio::time::timeout(REQUEST_BUDGET, status_of(channel, path, false))
+        .await
+        .map_err(|_| HealthError::Transport("request timed out".to_owned()))?
+}
+
 async fn request(channel: &BackendChannel) -> Result<StartupPhase, HealthError> {
+    phase_for_status(status_of(channel, HEALTH_PATH, true).await?)
+}
+
+/// Performs one request and returns its status.
+async fn status_of(
+    channel: &BackendChannel,
+    path: &str,
+    with_credential: bool,
+) -> Result<StatusCode, HealthError> {
     let stream = TcpStream::connect(channel.address())
         .await
         .map_err(|err| HealthError::Transport(err.to_string()))?;
@@ -147,14 +217,17 @@ async fn request(channel: &BackendChannel) -> Result<StartupPhase, HealthError> 
         let _ = connection.await;
     });
 
-    let request = Request::builder()
+    let mut builder = Request::builder()
         .method("GET")
-        .uri(HEALTH_PATH)
-        .header(header::HOST, channel.host())
-        .header(
+        .uri(path)
+        .header(header::HOST, channel.host());
+    if with_credential {
+        builder = builder.header(
             header::AUTHORIZATION,
             format!("Bearer {}", channel.secret().expose()),
-        )
+        );
+    }
+    let request = builder
         .body(Empty::<Bytes>::new())
         .map_err(|err| HealthError::Transport(err.to_string()))?;
 
@@ -167,7 +240,7 @@ async fn request(channel: &BackendChannel) -> Result<StartupPhase, HealthError> 
     let _ = response.into_body().collect().await;
     pump.abort();
 
-    phase_for_status(status)
+    Ok(status)
 }
 
 #[cfg(test)]

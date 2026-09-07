@@ -19,8 +19,9 @@
 //! process for as long as a model is loaded.
 
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 
 /// Bytes of entropy in a channel secret.
 const SECRET_BYTES: usize = 32;
@@ -64,6 +65,77 @@ impl ChannelSecret {
 impl fmt::Debug for ChannelSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ChannelSecret(<redacted>)")
+    }
+}
+
+/// A secret written to a file for a backend to read, removed when dropped.
+///
+/// The secret is passed this way rather than on the command line. A process's
+/// arguments are readable by other local accounts: on Linux `/proc/<pid>/cmdline`
+/// is world-readable by default, so a credential passed as an argument is visible
+/// to every user on the machine, not merely to the user who owns the backend. That
+/// would defeat the per-user isolation the rest of this design maintains.
+///
+/// Keeping it out of the arguments also keeps it out of anything that renders a
+/// worker specification, since those arguments are ordinary strings with no
+/// redaction of their own.
+#[derive(Debug)]
+pub struct SecretFile {
+    path: PathBuf,
+}
+
+impl SecretFile {
+    /// Writes a secret to a file only its owner can read.
+    ///
+    /// Permissions are applied at creation rather than afterwards, so the file is
+    /// never briefly readable by others.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be created or written.
+    pub fn create(directory: &Path, secret: &ChannelSecret) -> io::Result<Self> {
+        std::fs::create_dir_all(directory)?;
+
+        // Named per file rather than per process. A runtime supervises several
+        // backends at once, so a per-process name would have them overwrite each
+        // other's credential, and the first to finish would delete a file another
+        // backend was still relying on.
+        let mut unique = [0u8; 8];
+        getrandom::fill(&mut unique)
+            .map_err(|err| io::Error::other(format!("system randomness unavailable: {err}")))?;
+        let suffix: String = unique.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = directory.join(format!("backend-{}-{suffix}.key", std::process::id()));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        // On Windows the per-user temporary directory is already restricted to its
+        // owner by the inherited access control list.
+
+        let mut file = options.open(&path)?;
+        file.write_all(secret.expose().as_bytes())?;
+        file.flush()?;
+        drop(file);
+
+        Ok(Self { path })
+    }
+
+    /// The path to hand to the backend.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SecretFile {
+    fn drop(&mut self) {
+        // Best effort. The file is owner-only and in a temporary directory, so a
+        // failure here leaves it no more exposed than while it was in use.
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 

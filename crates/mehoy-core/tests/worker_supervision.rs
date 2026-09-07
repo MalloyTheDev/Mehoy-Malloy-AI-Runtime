@@ -158,8 +158,13 @@ async fn an_unexpected_exit_after_ready_is_a_failure_carrying_its_code() {
     // ADR-0002 requires a crashed worker to be reported rather than silently
     // restarted, and the cause to be carried rather than flattened.
     let supervisor = ProcessWorker;
+    // The delay must comfortably exceed the readiness poll interval. At 50ms the
+    // worker could die before readiness was ever observed, which reports an exit
+    // during startup rather than the post-ready crash this test is about. That is
+    // correct runtime behaviour (a dead process is not ready) but the wrong thing
+    // to be testing here, and it raced differently on Linux than on Windows.
     let mut handle = supervisor
-        .spawn(spec(&["--crash-after-ready", "50"], quick()))
+        .spawn(spec(&["--crash-after-ready", "1500"], quick()))
         .await
         .expect("worker starts");
     supervisor

@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mehoy_backend_llama::{BackendChannel, EXECUTABLE_ENV};
+use mehoy_backend_llama::{BackendChannel, EXECUTABLE_ENV, SecretFile};
 use mehoy_core::id::IdAllocator;
 use mehoy_core::worker::log::DEFAULT_CAPTURE_LINES;
 use mehoy_core::worker::{Deadlines, ProcessWorker, WorkerSpec};
@@ -32,6 +32,19 @@ async fn main() {
         }
     };
 
+    // Delivered by file, matching the production path: process arguments are
+    // readable by other local accounts.
+    let secret_file = match SecretFile::create(
+        &std::env::temp_dir().join("mehoy-backend"),
+        channel.secret(),
+    ) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("llama_orphan_parent: cannot write the credential file: {err}");
+            std::process::exit(1);
+        }
+    };
+
     let ids = IdAllocator::new();
     let spec = WorkerSpec {
         id: ids.worker(),
@@ -43,8 +56,8 @@ async fn main() {
             channel.host(),
             "--port".to_owned(),
             channel.port().to_string(),
-            "--api-key".to_owned(),
-            channel.secret().expose().to_owned(),
+            "--api-key-file".to_owned(),
+            secret_file.path().display().to_string(),
             "--no-webui".to_owned(),
         ],
         deadlines: Deadlines {

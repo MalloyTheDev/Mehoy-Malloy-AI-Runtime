@@ -313,6 +313,10 @@ async fn a_world_accessible_endpoint_directory_is_refused() {
     let address = unique_address("insecure-dir");
     let path = std::path::PathBuf::from(address.as_str());
     let dir = path.parent().expect("address has a parent").to_path_buf();
+    // The shared parent must be created privately first. A plain create_dir_all on
+    // the subdirectory would create the parent with the process umask, poisoning it
+    // for every other test that uses the same parent.
+    create_private_dir(&dir);
     let open_dir = dir.join("world-readable");
     std::fs::create_dir_all(&open_dir).expect("test directory is creatable");
     std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o755))
@@ -338,6 +342,7 @@ async fn a_directory_created_by_the_runtime_is_private() {
     let address = unique_address("created-dir");
     let path = std::path::PathBuf::from(address.as_str());
     let dir = path.parent().expect("address has a parent").to_path_buf();
+    create_private_dir(&dir);
     let fresh = dir.join("runtime-created");
     let inside = EndpointAddress::new(fresh.join("mehoyd.sock").to_string_lossy().into_owned());
 
