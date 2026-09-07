@@ -11,6 +11,7 @@
 
 use std::fmt;
 
+use crate::cancel::{CancellationCause, RequestHandle, RequestState};
 use crate::id::RequestId;
 
 /// An identifier for a task this build does not itself define.
@@ -545,13 +546,21 @@ pub struct GenerationSummary {
 /// There is no failure variant. A stream yields `Result`, so a failure ends the
 /// stream rather than appearing as a step within it, and no variant exists here
 /// without semantics behind it.
+///
+/// A stream ends in exactly one of three ways: [`GenerationEvent::Completed`],
+/// [`GenerationEvent::Cancelled`], or an error. Never two, and never none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerationEvent {
-    /// The runtime accepted the request and established the backend stream.
+    /// The runtime accepted the request for execution and gave it an identity.
     ///
-    /// Deliberately not "the model produced its first token". Separating
-    /// acceptance from first output is what makes the interval between this event
-    /// and the first [`GenerationEvent::TextDelta`] a measurable quantity later.
+    /// Deliberately not "the backend stream is established", and deliberately not
+    /// "the model produced its first token". A backend may spend a long time
+    /// reading the input before it answers at all, so an event placed at the
+    /// backend's first response would sit after the work had already been running
+    /// for seconds. ADR-0009 records why this boundary moved.
+    ///
+    /// The interval between this and the first [`GenerationEvent::TextDelta`] is
+    /// therefore genuinely time to first output.
     Started { request_id: RequestId },
     /// Generated text, valid on its own.
     ///
@@ -564,6 +573,19 @@ pub enum GenerationEvent {
         request_id: RequestId,
         summary: GenerationSummary,
     },
+    /// The generation was stopped. No further events follow.
+    ///
+    /// Emitted when the runtime has finished executing the request and released
+    /// its transport, not when stopping was requested.
+    ///
+    /// Deliberately not a claim that the backend has stopped, which the runtime
+    /// cannot see. A measured engine kept working for ten seconds after this event
+    /// because it finishes reading its input before reacting, so a consumer that
+    /// reads this as "the accelerator is free" will be wrong.
+    Cancelled {
+        request_id: RequestId,
+        cause: CancellationCause,
+    },
 }
 
 impl GenerationEvent {
@@ -573,7 +595,8 @@ impl GenerationEvent {
         match *self {
             Self::Started { request_id }
             | Self::TextDelta { request_id, .. }
-            | Self::Completed { request_id, .. } => request_id,
+            | Self::Completed { request_id, .. }
+            | Self::Cancelled { request_id, .. } => request_id,
         }
     }
 }
@@ -622,29 +645,35 @@ pub const GENERATION_STREAM_BUFFER: usize = 32;
 
 type StreamItem = Result<GenerationEvent, GenerationStreamError>;
 
-/// Creates a generation stream and the handle a backend emits into.
+/// Creates a generation stream and the sink a backend emits into.
 ///
 /// [`GenerationEvent::Started`] is placed in the buffer here rather than sent by
 /// the caller, which is what makes it structurally impossible to emit it twice,
-/// to omit it, or to emit it after a delta. Call this once the backend stream is
-/// actually established, since that is what the event claims.
+/// to omit it, or to emit it after a delta. Call this as soon as the request is
+/// accepted, since that is what the event now claims: the backend has not
+/// necessarily been contacted yet.
+///
+/// The request handle is shared rather than owned, so whoever can cancel the
+/// request and whoever is reading its output observe the same state.
 #[must_use]
-pub fn generation_stream(request_id: RequestId) -> (GenerationSink, GenerationStream) {
+pub fn generation_stream(handle: RequestHandle) -> (GenerationSink, GenerationStream) {
+    let request_id = handle.id();
     let (sender, receiver) = tokio::sync::mpsc::channel(GENERATION_STREAM_BUFFER);
     sender
         .try_send(Ok(GenerationEvent::Started { request_id }))
         .expect("a freshly created buffer has room for the first event");
     (
         GenerationSink {
-            request_id,
+            handle: handle.clone(),
             sender,
             finished: false,
         },
         GenerationStream {
             receiver,
-            request_id,
+            handle,
             deltas: 0,
             completed: false,
+            cancelled: None,
             finished: false,
         },
     )
@@ -656,7 +685,7 @@ pub fn generation_stream(request_id: RequestId) -> (GenerationSink, GenerationSt
 /// backpressure to whatever is driving this sink instead of accumulating.
 #[derive(Debug)]
 pub struct GenerationSink {
-    request_id: RequestId,
+    handle: RequestHandle,
     sender: tokio::sync::mpsc::Sender<StreamItem>,
     finished: bool,
 }
@@ -664,8 +693,14 @@ pub struct GenerationSink {
 impl GenerationSink {
     /// The request being generated.
     #[must_use]
-    pub const fn request_id(&self) -> RequestId {
-        self.request_id
+    pub fn request_id(&self) -> RequestId {
+        self.handle.id()
+    }
+
+    /// The shared state of this request.
+    #[must_use]
+    pub const fn handle(&self) -> &RequestHandle {
+        &self.handle
     }
 
     /// Emits generated text.
@@ -684,7 +719,7 @@ impl GenerationSink {
             return true;
         }
         let event = GenerationEvent::TextDelta {
-            request_id: self.request_id,
+            request_id: self.handle.id(),
             text,
         };
         self.sender.send(Ok(event)).await.is_ok()
@@ -696,9 +731,29 @@ impl GenerationSink {
             return;
         }
         self.finished = true;
+        self.handle.finish(RequestState::Completed);
         let event = GenerationEvent::Completed {
-            request_id: self.request_id,
+            request_id: self.handle.id(),
             summary,
+        };
+        let _ = self.sender.send(Ok(event)).await;
+    }
+
+    /// Ends the stream because the request was stopped.
+    ///
+    /// Call this once execution has actually ended. Consuming the sink is what
+    /// guarantees exactly one terminal outcome: a completion cannot follow a
+    /// cancellation, and a cancellation cannot follow a completion, because
+    /// whichever happens first takes the sink with it.
+    pub async fn cancel(mut self, cause: CancellationCause) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.handle.finish(RequestState::Cancelled);
+        let event = GenerationEvent::Cancelled {
+            request_id: self.handle.id(),
+            cause,
         };
         let _ = self.sender.send(Ok(event)).await;
     }
@@ -711,6 +766,7 @@ impl GenerationSink {
             return;
         }
         self.finished = true;
+        self.handle.finish(RequestState::Failed);
         let _ = self.sender.send(Err(error)).await;
     }
 }
@@ -723,14 +779,17 @@ impl GenerationSink {
 #[derive(Debug)]
 pub struct GenerationStream {
     receiver: tokio::sync::mpsc::Receiver<StreamItem>,
-    request_id: RequestId,
+    handle: RequestHandle,
     deltas: usize,
     /// Whether a terminal completion was observed.
     ///
     /// Deliberately distinct from `finished`. A stream that delivers content and
-    /// then fails is finished but did not complete, and conflating the two would
-    /// let a failed generation stand as evidence that generation works.
+    /// then fails or is cancelled is finished but did not complete, and conflating
+    /// the two would let an interrupted generation stand as evidence that
+    /// generation works.
     completed: bool,
+    /// Why the request was stopped, if it was.
+    cancelled: Option<CancellationCause>,
     /// Whether any further events can arrive.
     finished: bool,
 }
@@ -738,8 +797,18 @@ pub struct GenerationStream {
 impl GenerationStream {
     /// The request being generated.
     #[must_use]
-    pub const fn request_id(&self) -> RequestId {
-        self.request_id
+    pub fn request_id(&self) -> RequestId {
+        self.handle.id()
+    }
+
+    /// The shared state of this request.
+    ///
+    /// Available so a consumer can see that a request is stopping before the
+    /// terminal event arrives, which for a backend that finishes reading its input
+    /// before reacting can be several seconds later.
+    #[must_use]
+    pub const fn handle(&self) -> &RequestHandle {
+        &self.handle
     }
 
     /// Awaits the next event, or `None` once the stream has ended.
@@ -760,6 +829,10 @@ impl GenerationStream {
                         self.completed = true;
                         self.finished = true;
                     }
+                    GenerationEvent::Cancelled { cause, .. } => {
+                        self.cancelled = Some(*cause);
+                        self.finished = true;
+                    }
                     GenerationEvent::Started { .. } => {}
                 }
                 Some(Ok(event))
@@ -770,11 +843,18 @@ impl GenerationStream {
             }
             None => {
                 self.finished = true;
+                self.handle.finish(RequestState::Failed);
                 Some(Err(GenerationStreamError::UnexpectedEnd {
                     detail: "the backend stream stopped without reporting an outcome".to_owned(),
                 }))
             }
         }
+    }
+
+    /// Why this request was stopped, if it was.
+    #[must_use]
+    pub const fn cancellation(&self) -> Option<CancellationCause> {
+        self.cancelled
     }
 
     /// Whether this stream demonstrated text generation.
@@ -783,37 +863,85 @@ impl GenerationStream {
     /// delta. An opened stream, a first delta, or content without a completion are
     /// each insufficient: the backend could still fail immediately afterwards, and
     /// a capability claim that a later event would contradict is not evidence.
+    ///
+    /// A cancelled request does not qualify even when it produced real text. The
+    /// runtime stopped it before the backend said it was finished, so what it
+    /// would have done is unknown.
     #[must_use]
     pub const fn demonstrated_generation(&self) -> bool {
         self.completed && self.deltas > 0
     }
 
-    /// Collects the whole stream into one result.
+    /// Collects the whole stream into one outcome.
     ///
     /// For callers that want streaming transport but not incremental delivery, and
     /// for comparing a stream against the non-streaming path over the same request.
     ///
+    /// Returns an outcome rather than a result, because a stopped request did not
+    /// produce one. Whatever text arrived before it stopped is still returned, so
+    /// a caller can show partial output, but it is not presented as an answer the
+    /// model finished giving.
+    ///
     /// # Errors
     ///
     /// Returns the first error the stream yields.
-    pub async fn collect(&mut self) -> Result<GenerationResult, GenerationStreamError> {
+    pub async fn collect(&mut self) -> Result<GenerationOutcome, GenerationStreamError> {
         let mut text = String::new();
         while let Some(item) = self.next().await {
             match item? {
                 GenerationEvent::Started { .. } => {}
                 GenerationEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
                 GenerationEvent::Completed { summary, .. } => {
-                    return Ok(GenerationResult {
+                    return Ok(GenerationOutcome::Completed(GenerationResult {
                         text,
                         finish_reason: summary.finish_reason,
                         usage: summary.usage,
-                    });
+                    }));
+                }
+                GenerationEvent::Cancelled { cause, .. } => {
+                    return Ok(GenerationOutcome::Cancelled { text, cause });
                 }
             }
         }
         Err(GenerationStreamError::UnexpectedEnd {
-            detail: "the stream ended without a completion".to_owned(),
+            detail: "the stream ended without a terminal event".to_owned(),
         })
+    }
+}
+
+/// How a generation ended, when it ended without failing.
+///
+/// Kept distinct from [`GenerationResult`] so that a caller cannot accidentally
+/// treat a stopped request as a finished answer. The partial text is available
+/// for display, and it is not a result.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenerationOutcome {
+    /// The model finished and said why.
+    Completed(GenerationResult),
+    /// The request was stopped before the model finished.
+    Cancelled {
+        text: String,
+        cause: CancellationCause,
+    },
+}
+
+impl GenerationOutcome {
+    /// Whatever text was produced, finished or not.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Completed(result) => &result.text,
+            Self::Cancelled { text, .. } => text,
+        }
+    }
+
+    /// The finished result, or `None` if the request was stopped.
+    #[must_use]
+    pub const fn completed(&self) -> Option<&GenerationResult> {
+        match self {
+            Self::Completed(result) => Some(result),
+            Self::Cancelled { .. } => None,
+        }
     }
 }
 
@@ -821,8 +949,8 @@ impl GenerationStream {
 mod tests {
     use super::*;
 
-    fn request() -> RequestId {
-        RequestId::from_raw(1)
+    fn request() -> RequestHandle {
+        RequestHandle::new(RequestId::from_raw(1))
     }
 
     fn summary() -> GenerationSummary {
@@ -841,7 +969,7 @@ mod tests {
         assert_eq!(
             stream.next().await,
             Some(Ok(GenerationEvent::Started {
-                request_id: request()
+                request_id: RequestId::from_raw(1)
             }))
         );
     }
@@ -915,7 +1043,10 @@ mod tests {
         sink.delta("lo".to_owned()).await;
         sink.complete(summary()).await;
 
-        let result = stream.collect().await.expect("completes");
+        let outcome = stream.collect().await.expect("completes");
+        let result = outcome
+            .completed()
+            .expect("a completion, not a cancellation");
         assert_eq!(result.text, "Hello");
         assert_eq!(result.finish_reason, FinishReason::Stop);
     }

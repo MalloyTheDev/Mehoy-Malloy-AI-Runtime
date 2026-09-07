@@ -9,6 +9,7 @@
 //! the network by construction, with access control delegated to the operating
 //! system rather than reimplemented here.
 
+pub mod cancel;
 pub mod event;
 pub mod id;
 pub mod inference;

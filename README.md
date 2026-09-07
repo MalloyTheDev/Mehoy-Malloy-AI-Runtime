@@ -48,10 +48,17 @@ get right before anything else is built on top of it.
   event framing and wire format confined to the backend adapter, and bounded
   buffering so a slow consumer slows the backend rather than this process
 
+- Cancelling a request by identity, independently of who is reading its output,
+  with an idle budget that shares the same stopping machinery while reporting its
+  own distinct cause
+
 **Not implemented**
 
-- Cancellation. A stream runs to its own end, and abandoning it stops the backend
-  at the next event rather than on request
+- Observing that a backend has actually stopped. The runtime knows it released the
+  request's transport; whether the engine then stops promptly is a property of the
+  engine, measured per build rather than guaranteed here
+- Concurrency limits and queueing. Requests have identity, which is what those
+  would need, and neither exists
 - Conversation input. Continuation is the primitive; a conversation shape arrives
   when something can render a template for it
 - Any model class beyond text embeddings and text generation. Nothing prevents them;

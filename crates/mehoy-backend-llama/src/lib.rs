@@ -29,7 +29,7 @@ mod sse;
 pub use channel::{BackendChannel, ChannelSecret, SecretFile};
 pub use compatibility::{Compatibility, LaunchMode, ModelDescriptor};
 pub use embed::{EmbedError, embed};
-pub use generate::{GenerateError, generate, stream};
+pub use generate::{GenerateError, cancellation_strategy, generate, start_generation};
 pub use health::{CredentialState, Readiness, StartupPhase};
 pub use identity::{BackendFamily, BackendIdentity};
 

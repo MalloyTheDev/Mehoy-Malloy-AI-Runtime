@@ -479,6 +479,9 @@ async fn drain_asserting_shape(
                 assert!(summary.is_none(), "Completed appeared twice");
                 summary = Some(reported);
             }
+            GenerationEvent::Cancelled { cause, .. } => {
+                panic!("nothing cancelled this request, yet it reported {cause}")
+            }
         }
         position += 1;
     }
@@ -506,9 +509,9 @@ async fn a_generative_model_actually_streams() {
         .expect("loads");
 
     let mut stream = loaded
-        .generate_text_stream(&generation_request())
-        .await
-        .expect("the stream opens");
+        .generate_stream(&generation_request())
+        .expect("the request is accepted")
+        .stream;
 
     let (text, summary) = drain_asserting_shape(&mut stream).await;
 
@@ -570,9 +573,9 @@ async fn a_stream_is_evidence_only_once_it_completes() {
     );
 
     let mut stream = loaded
-        .generate_text_stream(&generation_request())
-        .await
-        .expect("the stream opens");
+        .generate_stream(&generation_request())
+        .expect("the request is accepted")
+        .stream;
 
     // An open stream proves the backend accepted a request, nothing more.
     assert!(!stream.demonstrated_generation());
@@ -661,10 +664,16 @@ async fn both_delivery_modes_serve_the_same_request() {
         .expect("the model generates");
 
     let mut stream = loaded
-        .generate_text_stream(&generation_request())
+        .generate_stream(&generation_request())
+        .expect("the request is accepted")
+        .stream;
+    let streamed = stream
+        .collect()
         .await
-        .expect("the stream opens");
-    let streamed = stream.collect().await.expect("the stream completes");
+        .expect("the stream completes")
+        .completed()
+        .cloned()
+        .expect("a completion, since nothing cancelled this request");
 
     for (label, result) in [("whole", &whole), ("streamed", &streamed)] {
         assert!(!result.text.is_empty(), "{label} produced no content");
@@ -714,7 +723,7 @@ async fn a_stream_is_refused_before_reaching_a_backend_when_a_parameter_is_unusa
         ..GenerationParameters::default()
     });
 
-    match loaded.generate_text_stream(&request).await {
+    match loaded.generate_stream(&request) {
         Err(LoadError::InvalidRequest { detail }) => {
             assert!(
                 detail.contains("temperature"),

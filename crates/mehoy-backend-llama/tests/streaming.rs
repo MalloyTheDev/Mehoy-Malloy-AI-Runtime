@@ -12,11 +12,13 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use mehoy_backend_llama::{BackendChannel, ChannelSecret, stream};
+use mehoy_backend_llama::{BackendChannel, ChannelSecret, start_generation};
+use mehoy_core::cancel::{CancellationCause, RequestBudget, RequestHandle};
 use mehoy_core::id::RequestId;
 use mehoy_core::inference::{
     FinishReason, GenerateTextRequest, GenerationEvent, GenerationStream, GenerationStreamError,
@@ -31,6 +33,14 @@ enum Script {
     Chunks(Vec<Vec<u8>>),
     /// Answer with this status and body instead of a stream.
     Status(u16, &'static str),
+    /// Accept the connection and never answer at all, not even headers.
+    NoHeaders,
+    /// Answer with headers and then say nothing, forever.
+    Silent,
+    /// Send these runs, then hold the connection open without sending anything.
+    ChunksThenSilence(Vec<Vec<u8>>),
+    /// Say nothing, and record when the peer goes away.
+    SilentUntilClosed { closed: Arc<AtomicBool> },
     /// Send events until the client stops reading, counting what got through.
     Flood {
         events: usize,
@@ -73,6 +83,37 @@ async fn backend(script: Script) -> BackendChannel {
                         return;
                     }
                     let _ = outbound.flush().await;
+                }
+            }
+            Script::NoHeaders => {
+                std::future::pending::<()>().await;
+            }
+            Script::Silent => {
+                let _ = outbound.write_all(headers().as_bytes()).await;
+                let _ = outbound.flush().await;
+                std::future::pending::<()>().await;
+            }
+            Script::ChunksThenSilence(chunks) => {
+                let _ = outbound.write_all(headers().as_bytes()).await;
+                for chunk in chunks {
+                    if outbound.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                    let _ = outbound.flush().await;
+                }
+                std::future::pending::<()>().await;
+            }
+            Script::SilentUntilClosed { closed } => {
+                let _ = outbound.write_all(headers().as_bytes()).await;
+                let _ = outbound.flush().await;
+                // Writing to a socket whose peer has gone eventually fails, which
+                // is how this observes the cancellation taking effect.
+                loop {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    if outbound.write_all(b": ping\n\n").await.is_err() {
+                        closed.store(true, Ordering::SeqCst);
+                        return;
+                    }
                 }
             }
             Script::Flood {
@@ -122,10 +163,19 @@ fn terminal_with_usage(text: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-async fn open(script: Script) -> Result<GenerationStream, GenerationStreamError> {
+async fn open(script: Script) -> GenerationStream {
+    open_within(script, RequestBudget::default()).await
+}
+
+/// Starts a generation against the fake backend.
+///
+/// Returns a stream rather than a result: starting a request no longer waits for
+/// the backend, so a refusal arrives through the stream like every other failure.
+async fn open_within(script: Script, budget: RequestBudget) -> GenerationStream {
     let channel = backend(script).await;
     let request = GenerateTextRequest::continuation("hello");
-    stream(&channel, &request, RequestId::from_raw(7)).await
+    let handle = RequestHandle::new(RequestId::from_raw(7));
+    start_generation(&channel, &request, handle, budget)
 }
 
 /// Drains a stream, returning the events and the outcome.
@@ -183,6 +233,12 @@ fn assert_shape(events: &[GenerationEvent], expected_text: &str) -> FinishReason
                 );
                 finish = Some(summary.finish_reason.clone());
             }
+            GenerationEvent::Cancelled { cause, .. } => {
+                panic!(
+                    "unexpected cancellation ({cause}) at position {}",
+                    position + 1
+                )
+            }
         }
     }
 
@@ -198,8 +254,7 @@ async fn a_normal_stream_starts_delivers_and_completes_in_that_order() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, failure) = drain(&mut stream).await;
     assert!(failure.is_none(), "unexpected failure: {failure:?}");
@@ -213,8 +268,7 @@ async fn every_event_carries_the_request_it_belongs_to() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, _) = drain(&mut stream).await;
     assert!(!events.is_empty());
@@ -230,8 +284,7 @@ async fn usage_and_finish_reason_are_normalised_from_the_terminal_event() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, _) = drain(&mut stream).await;
     let GenerationEvent::Completed { summary, .. } = events.last().expect("a last event") else {
@@ -255,8 +308,7 @@ async fn an_event_split_across_writes_arrives_as_one_delta() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, failure) = drain(&mut stream).await;
     assert!(failure.is_none(), "unexpected failure: {failure:?}");
@@ -280,8 +332,7 @@ async fn multibyte_text_split_across_writes_is_never_delivered_broken() {
             terminal_with_usage(""),
             b"data: [DONE]\n\n".to_vec(),
         ]))
-        .await
-        .expect("the stream opens");
+        .await;
 
         let (events, failure) = drain(&mut stream).await;
         assert!(failure.is_none(), "split {split} failed: {failure:?}");
@@ -304,8 +355,7 @@ async fn an_empty_delta_never_reaches_the_consumer() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, _) = drain(&mut stream).await;
     assert_eq!(assert_shape(&events, "real"), FinishReason::Stop);
@@ -320,8 +370,7 @@ async fn a_malformed_event_fails_the_stream_rather_than_completing_it() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, failure) = drain(&mut stream).await;
     assert!(
@@ -341,9 +390,7 @@ async fn a_malformed_event_fails_the_stream_rather_than_completing_it() {
 async fn a_truncated_stream_is_an_error_and_not_a_completion() {
     // The backend produced content and then vanished. A consumer that only checked
     // for the end of the stream would treat this as a finished answer.
-    let mut stream = open(Script::Chunks(vec![event("partial answer", None)]))
-        .await
-        .expect("the stream opens");
+    let mut stream = open(Script::Chunks(vec![event("partial answer", None)])).await;
 
     let (events, failure) = drain(&mut stream).await;
     assert!(
@@ -362,9 +409,7 @@ async fn a_truncated_stream_is_an_error_and_not_a_completion() {
 #[tokio::test]
 async fn a_stream_cut_inside_an_event_is_an_error() {
     let whole = event("started", None);
-    let mut stream = open(Script::Chunks(vec![whole[..15].to_vec()]))
-        .await
-        .expect("the stream opens");
+    let mut stream = open(Script::Chunks(vec![whole[..15].to_vec()])).await;
 
     let (_, failure) = drain(&mut stream).await;
     match failure {
@@ -383,8 +428,7 @@ async fn a_done_marker_without_a_finish_reason_is_an_error() {
         event("text", None),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (_, failure) = drain(&mut stream).await;
     assert!(
@@ -394,15 +438,46 @@ async fn a_done_marker_without_a_finish_reason_is_an_error() {
 }
 
 #[tokio::test]
-async fn a_refused_request_never_becomes_a_stream() {
-    let opened = open(Script::Status(401, "{}")).await;
-    match opened {
-        Err(GenerationStreamError::Refused { detail }) => {
+async fn a_refused_request_fails_through_its_stream() {
+    // Starting a request no longer waits for the backend, so a refusal cannot be
+    // reported by the starting call. It has to reach the caller the same way every
+    // other failure does.
+    let mut stream = open(Script::Status(401, "{}")).await;
+    let (events, failure) = drain(&mut stream).await;
+
+    match failure {
+        Some(GenerationStreamError::Refused { detail }) => {
             assert!(detail.contains("credential"), "unexpected detail: {detail}");
         }
-        Err(other) => panic!("expected a refusal, got {other:?}"),
-        Ok(_) => panic!("a refused request must not produce a stream"),
+        other => panic!("expected a refusal, got {other:?}"),
     }
+    assert_eq!(
+        events.len(),
+        1,
+        "a refused request should still have been accepted, and nothing more"
+    );
+    assert!(matches!(events[0], GenerationEvent::Started { .. }));
+    assert!(!stream.demonstrated_generation());
+}
+
+#[tokio::test]
+async fn a_request_is_accepted_before_the_backend_is_reached() {
+    // The property ADR-0009 turns on: the request exists, and can be observed and
+    // stopped, before anything has been sent anywhere.
+    let mut stream = open(Script::Chunks(vec![
+        event("hi", None),
+        terminal_with_usage(""),
+        b"data: [DONE]\n\n".to_vec(),
+    ]))
+    .await;
+
+    assert_eq!(
+        stream.next().await,
+        Some(Ok(GenerationEvent::Started {
+            request_id: RequestId::from_raw(7)
+        })),
+        "acceptance is the first thing a consumer sees"
+    );
 }
 
 #[tokio::test]
@@ -412,8 +487,7 @@ async fn nothing_is_yielded_after_the_stream_ends() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, _) = drain(&mut stream).await;
     assert!(matches!(
@@ -431,8 +505,7 @@ async fn a_stream_only_counts_as_evidence_once_it_completes() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     assert!(
         !stream.demonstrated_generation(),
@@ -448,6 +521,7 @@ async fn a_stream_only_counts_as_evidence_once_it_completes() {
             ),
             GenerationEvent::Completed { .. } => completed = true,
             GenerationEvent::Started { .. } => {}
+            GenerationEvent::Cancelled { cause, .. } => panic!("unexpected cancellation: {cause}"),
         }
     }
 
@@ -461,8 +535,7 @@ async fn a_completion_carrying_no_content_demonstrates_nothing() {
         terminal_with_usage(""),
         b"data: [DONE]\n\n".to_vec(),
     ]))
-    .await
-    .expect("the stream opens");
+    .await;
 
     let (events, failure) = drain(&mut stream).await;
     assert!(failure.is_none(), "unexpected failure: {failure:?}");
@@ -489,8 +562,7 @@ async fn a_consumer_that_stops_reading_stops_the_backend() {
         written: Arc::clone(&written),
         completed: Arc::clone(&completed),
     })
-    .await
-    .expect("the stream opens");
+    .await;
 
     // Take a couple of events, then stop.
     assert!(matches!(
@@ -525,8 +597,7 @@ async fn abandoning_a_stream_releases_the_backend() {
         written: Arc::clone(&written),
         completed: Arc::clone(&completed),
     })
-    .await
-    .expect("the stream opens");
+    .await;
 
     assert!(stream.next().await.is_some());
     drop(stream);
@@ -538,4 +609,340 @@ async fn abandoning_a_stream_releases_the_backend() {
         !completed.load(Ordering::SeqCst),
         "the backend ran to completion after its consumer went away"
     );
+}
+
+// ------------------------------------------------------------------ cancellation
+
+/// Starts a generation whose handle the test keeps, so it can stop it.
+async fn open_cancellable(
+    script: Script,
+    budget: RequestBudget,
+) -> (RequestHandle, GenerationStream) {
+    let channel = backend(script).await;
+    let request = GenerateTextRequest::continuation("hello");
+    let handle = RequestHandle::new(RequestId::from_raw(11));
+    let stream = start_generation(&channel, &request, handle.clone(), budget);
+    (handle, stream)
+}
+
+#[tokio::test]
+async fn a_request_cancelled_before_anything_arrives_ends_as_cancelled() {
+    // The hardest case on the measured engine: a large prompt means the backend
+    // sends nothing for a long time, so this is the window where cancellation is
+    // most valuable and least observable.
+    let (handle, mut stream) = open_cancellable(Script::Silent, RequestBudget::default()).await;
+
+    assert_eq!(
+        stream.next().await,
+        Some(Ok(GenerationEvent::Started {
+            request_id: RequestId::from_raw(11)
+        }))
+    );
+    assert!(handle.request_cancellation(CancellationCause::User));
+
+    let (events, failure) = drain(&mut stream).await;
+    assert!(
+        failure.is_none(),
+        "cancelling is not a failure: {failure:?}"
+    );
+    match events.last() {
+        Some(GenerationEvent::Cancelled { cause, .. }) => {
+            assert_eq!(*cause, CancellationCause::User);
+        }
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+    assert!(!stream.demonstrated_generation());
+}
+
+#[tokio::test]
+async fn a_request_cancelled_after_content_keeps_what_arrived() {
+    let (handle, mut stream) = open_cancellable(
+        Script::ChunksThenSilence(vec![event("partial", None)]),
+        RequestBudget::default(),
+    )
+    .await;
+
+    // Wait for real content, then stop.
+    let mut text = String::new();
+    while let Some(Ok(item)) = stream.next().await {
+        if let GenerationEvent::TextDelta { text: delta, .. } = item {
+            text.push_str(&delta);
+            break;
+        }
+    }
+    assert_eq!(text, "partial");
+    handle.request_cancellation(CancellationCause::User);
+
+    let (events, failure) = drain(&mut stream).await;
+    assert!(failure.is_none(), "unexpected failure: {failure:?}");
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Cancelled { .. })
+    ));
+    assert!(
+        !stream.demonstrated_generation(),
+        "a cancelled request is not evidence that generation works"
+    );
+}
+
+#[tokio::test]
+async fn a_silent_backend_is_stopped_by_the_idle_budget() {
+    // Issue 6: the liveness bound is now reachable from a test because the budget
+    // is a parameter rather than a constant.
+    let (_handle, mut stream) = open_cancellable(
+        Script::ChunksThenSilence(vec![event("one", None)]),
+        RequestBudget {
+            stream_idle: Duration::from_millis(300),
+        },
+    )
+    .await;
+
+    let (events, failure) = drain(&mut stream).await;
+    assert!(
+        failure.is_none(),
+        "an idle backend is stopped, not a failure: {failure:?}"
+    );
+    match events.last() {
+        Some(GenerationEvent::Cancelled { cause, .. }) => {
+            assert_eq!(
+                *cause,
+                CancellationCause::StreamIdleTimeout,
+                "the cause must say it timed out rather than that someone asked"
+            );
+        }
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, GenerationEvent::TextDelta { .. })),
+        "the delta that did arrive should still have been delivered"
+    );
+}
+
+#[tokio::test]
+async fn a_user_cancellation_beats_a_later_idle_timeout() {
+    // Both use the same stopping machinery, and the cause must still say which
+    // one actually stopped it.
+    let (handle, mut stream) = open_cancellable(
+        Script::Silent,
+        RequestBudget {
+            stream_idle: Duration::from_secs(30),
+        },
+    )
+    .await;
+
+    handle.request_cancellation(CancellationCause::User);
+    let (events, _) = drain(&mut stream).await;
+    match events.last() {
+        Some(GenerationEvent::Cancelled { cause, .. }) => {
+            assert_eq!(*cause, CancellationCause::User);
+        }
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_request_that_already_completed_changes_nothing() {
+    let (handle, mut stream) = open_cancellable(
+        Script::Chunks(vec![
+            event("done", None),
+            terminal_with_usage(""),
+            b"data: [DONE]\n\n".to_vec(),
+        ]),
+        RequestBudget::default(),
+    )
+    .await;
+
+    let (events, _) = drain(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Completed { .. })
+    ));
+    assert!(
+        !handle.request_cancellation(CancellationCause::User),
+        "a finished request cannot be cancelled"
+    );
+    assert_eq!(handle.state(), mehoy_core::cancel::RequestState::Completed);
+    assert!(
+        stream.next().await.is_none(),
+        "an event followed the terminal one"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_request_releases_its_connection() {
+    // The mechanism this backend actually has: closing the request's transport.
+    // If the connection stayed open, the engine would keep working.
+    let closed = Arc::new(AtomicBool::new(false));
+    let channel = backend(Script::SilentUntilClosed {
+        closed: Arc::clone(&closed),
+    })
+    .await;
+    let request = GenerateTextRequest::continuation("hello");
+    let handle = RequestHandle::new(RequestId::from_raw(12));
+    let mut stream = start_generation(&channel, &request, handle.clone(), RequestBudget::default());
+
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(GenerationEvent::Started { .. }))
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !closed.load(Ordering::SeqCst),
+        "the connection closed early"
+    );
+
+    handle.request_cancellation(CancellationCause::User);
+    let (events, _) = drain(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Cancelled { .. })
+    ));
+
+    // The fake backend notices its peer has gone.
+    for _ in 0..50 {
+        if closed.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the request's connection was never closed, so the backend was never told to stop");
+}
+
+#[tokio::test]
+async fn a_request_cancelled_before_the_backend_answers_at_all_ends_as_cancelled() {
+    // Cancelling before any response header exists. On the measured engine this is
+    // the whole input-processing window, which for a large prompt is most of the
+    // request.
+    let (handle, mut stream) = open_cancellable(Script::NoHeaders, RequestBudget::default()).await;
+
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(GenerationEvent::Started { .. }))
+    ));
+    assert_eq!(handle.state(), mehoy_core::cancel::RequestState::Starting);
+    handle.request_cancellation(CancellationCause::User);
+
+    let (events, failure) = drain(&mut stream).await;
+    assert!(
+        failure.is_none(),
+        "cancelling is not a failure: {failure:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Cancelled {
+            cause: CancellationCause::User,
+            ..
+        })
+    ));
+    assert_eq!(handle.state(), mehoy_core::cancel::RequestState::Cancelled);
+}
+
+#[tokio::test]
+async fn a_backend_that_dies_while_cancelling_still_reports_a_cancellation() {
+    // Both things happen at once. Whichever the execution notices first must be
+    // the only terminal outcome, and a failure must never be dressed up as a
+    // clean cancellation nor the reverse.
+    let (handle, mut stream) = open_cancellable(
+        Script::Chunks(vec![event("some", None)]),
+        RequestBudget::default(),
+    )
+    .await;
+
+    handle.request_cancellation(CancellationCause::User);
+    let (events, failure) = drain(&mut stream).await;
+
+    let terminals = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GenerationEvent::Completed { .. } | GenerationEvent::Cancelled { .. }
+            )
+        })
+        .count();
+    assert!(
+        terminals <= 1,
+        "a request reported {terminals} terminal events"
+    );
+    assert!(
+        terminals == 1 || failure.is_some(),
+        "the request ended with neither a terminal event nor a failure"
+    );
+    assert!(
+        handle.is_terminal(),
+        "the request never reached a terminal state"
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_stream_is_not_a_cancellation() {
+    // ADR-0009: a consumer that stops reading has not asked for the work to stop.
+    // The request must not silently report itself cancelled because a value went
+    // out of scope.
+    let (handle, stream) = open_cancellable(Script::Silent, RequestBudget::default()).await;
+
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        handle.cancellation_cause(),
+        None,
+        "dropping a stream must not record a cancellation cause"
+    );
+    assert_ne!(
+        handle.state(),
+        mehoy_core::cancel::RequestState::Cancelled,
+        "dropping a stream must not mark the request cancelled"
+    );
+}
+
+#[tokio::test]
+async fn a_request_reports_exactly_one_terminal_outcome_when_cancel_races_completion() {
+    // The cancellation and the last event are deliberately made to arrive at
+    // roughly the same moment, repeatedly, so the winner varies between runs.
+    for attempt in 0..25 {
+        let (handle, mut stream) = open_cancellable(
+            Script::Chunks(vec![
+                event("racing", None),
+                terminal_with_usage(""),
+                b"data: [DONE]
+
+"
+                .to_vec(),
+            ]),
+            RequestBudget::default(),
+        )
+        .await;
+
+        if attempt % 2 == 0 {
+            tokio::task::yield_now().await;
+        }
+        handle.request_cancellation(CancellationCause::User);
+
+        let (events, failure) = drain(&mut stream).await;
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GenerationEvent::Completed { .. } | GenerationEvent::Cancelled { .. }
+                )
+            })
+            .collect();
+        assert!(
+            terminals.len() <= 1,
+            "attempt {attempt} produced {} terminal events: {terminals:?}",
+            terminals.len()
+        );
+        assert!(
+            terminals.len() == 1 || failure.is_some(),
+            "attempt {attempt} ended with no outcome at all"
+        );
+        assert!(
+            handle.is_terminal(),
+            "attempt {attempt} left a live request"
+        );
+    }
 }

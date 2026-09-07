@@ -37,8 +37,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use mehoy_backend_llama::{
-    BackendChannel, LlamaCppBackend, LlamaCppWorkerSpec, ModelDescriptor, RunningBackend, stream,
+    BackendChannel, LlamaCppBackend, LlamaCppWorkerSpec, ModelDescriptor, RunningBackend,
+    start_generation,
 };
+use mehoy_core::cancel::{CancellationCause, RequestBudget, RequestHandle};
 use mehoy_core::id::{IdAllocator, RequestId, WorkerId};
 use mehoy_core::inference::{
     GenerateTextRequest, GenerationEvent, GenerationParameters, GenerationStream,
@@ -87,6 +89,20 @@ fn generative_container() -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// Starts a generation and hands back the handle that can stop it.
+///
+/// Starting no longer waits for the backend, so this returns immediately even for
+/// a prompt the engine will spend ten seconds reading.
+fn begin(
+    channel: &BackendChannel,
+    request: &GenerateTextRequest,
+    id: RequestId,
+) -> (RequestHandle, mehoy_core::inference::GenerationStream) {
+    let handle = RequestHandle::new(id);
+    let stream = start_generation(channel, request, handle.clone(), RequestBudget::default());
+    (handle, stream)
 }
 
 /// Stops a backend, reporting rather than hiding a failure to do so.
@@ -282,11 +298,9 @@ async fn a_completed_generation_frees_its_slot() {
             stop: Vec::new(),
         },
     );
-    let mut stream = stream(channel, &short, RequestId::from_raw(1))
-        .await
-        .expect("opens");
-    let result = stream.collect().await.expect("completes");
-    eprintln!("control generated {:?}", result.text);
+    let (_handle, mut stream) = begin(channel, &short, RequestId::from_raw(1));
+    let outcome = stream.collect().await.expect("completes");
+    eprintln!("control generated {:?}", outcome.text());
 
     let idle = wait_for_idle(channel, Duration::from_secs(20)).await;
     eprintln!("slot idle after natural completion: {idle:?}");
@@ -305,9 +319,7 @@ async fn dropping_the_stream_may_not_stop_the_work() {
     };
     let channel = backend.channel();
 
-    let mut generation = stream(channel, &long_request(), RequestId::from_raw(2))
-        .await
-        .expect("opens");
+    let (_handle, mut generation) = begin(channel, &long_request(), RequestId::from_raw(2));
     assert!(
         read_until_first_delta(&mut generation).await,
         "the model produced no content to interrupt"
@@ -406,9 +418,7 @@ async fn how_long_the_long_request_runs_when_nobody_interrupts_it() {
     let channel = backend.channel();
 
     let started = Instant::now();
-    let mut generation = stream(channel, &long_request(), RequestId::from_raw(9))
-        .await
-        .expect("opens");
+    let (_handle, mut generation) = begin(channel, &long_request(), RequestId::from_raw(9));
 
     let mut deltas = 0usize;
     let mut characters = 0usize;
@@ -429,6 +439,9 @@ async fn how_long_the_long_request_runs_when_nobody_interrupts_it() {
                 );
             }
             Ok(GenerationEvent::Started { .. }) => {}
+            Ok(GenerationEvent::Cancelled { cause, .. }) => {
+                panic!("nothing cancelled the baseline, yet it reported {cause}")
+            }
             Err(error) => panic!("the baseline generation failed: {error}"),
         }
     }
@@ -468,9 +481,7 @@ async fn how_long_a_long_prompt_takes_before_its_first_token() {
     let channel = backend.channel();
 
     let started = Instant::now();
-    let mut generation = stream(channel, &long_prompt_request(), RequestId::from_raw(10))
-        .await
-        .expect("opens");
+    let (_handle, mut generation) = begin(channel, &long_prompt_request(), RequestId::from_raw(10));
     let produced = read_until_first_delta(&mut generation).await;
     eprintln!(
         "BASELINE: first delta after {:?} (produced: {produced})",
@@ -483,58 +494,60 @@ async fn how_long_a_long_prompt_takes_before_its_first_token() {
 
 #[tokio::test]
 #[ignore = "loads a multi-gigabyte model and deliberately waits"]
-async fn abandoning_a_request_during_prefill() {
-    // For this engine the response does not begin until the prompt has been read,
-    // so there is no stream to drop while prefill is happening. The only thing that
-    // exists during that window is the in-flight request, and abandoning it is the
-    // only cancellation available. This is the case upstream has had defects in.
+async fn cancelling_during_prefill() {
+    // The engine does not begin its response until it has read the prompt, so
+    // during this window there is no response to abandon. The request exists
+    // regardless, which is the whole point of owning requests rather than
+    // streams, and cancelling it is the only stop available here.
     let Some(backend) = running_backend().await else {
         return;
     };
     let channel = backend.channel();
 
-    let request = long_prompt_request();
-    // Boxed rather than stack-pinned on purpose: pin! keeps the future in a hidden
-    // local that lives to the end of the scope, so dropping the handle would not
-    // actually abandon the request, and this test would prove nothing.
-    let mut pending = Box::pin(stream(channel, &request, RequestId::from_raw(11)));
+    let (handle, mut generation) = begin(channel, &long_prompt_request(), RequestId::from_raw(11));
 
-    // Poll for the engine picking the work up while the request is still open.
+    // Wait for the engine to actually pick the work up. Sampling at a fixed delay
+    // observes an idle engine, because dispatch is not instant.
     let started = Instant::now();
     let mut became_busy = None;
-    let opened = loop {
-        tokio::select! {
-            outcome = &mut pending => break Some(outcome),
-            () = tokio::time::sleep(Duration::from_millis(100)) => {
-                if became_busy.is_none() && any_slot_busy(channel).await == Some(true) {
-                    became_busy = Some(started.elapsed());
-                    break None;
-                }
-                if started.elapsed() > Duration::from_secs(30) {
-                    break None;
-                }
-            }
+    while started.elapsed() < Duration::from_secs(30) {
+        if any_slot_busy(channel).await == Some(true) {
+            became_busy = Some(started.elapsed());
+            break;
         }
-    };
-
-    assert!(
-        opened.is_none(),
-        "the response arrived before prefill could be observed, so nothing was interrupted"
-    );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let became_busy = became_busy.expect("the engine never picked the request up");
     eprintln!("prefill observably underway after {became_busy:?}");
 
-    let abandoned_at = Instant::now();
-    drop(pending);
-    eprintln!("request abandoned mid-prefill, before any response");
+    let requested_at = Instant::now();
+    assert!(handle.request_cancellation(CancellationCause::User));
+    eprintln!("cancellation requested during prefill, before any content");
+
+    // The runtime knows immediately that the request is stopping, which is not
+    // the same as the backend having stopped.
+    assert_eq!(handle.state(), mehoy_core::cancel::RequestState::Cancelling);
+
+    let mut terminal = None;
+    while let Some(item) = generation.next().await {
+        if let Ok(GenerationEvent::Cancelled { cause, .. }) = item {
+            terminal = Some((cause, requested_at.elapsed()));
+        }
+    }
+    match terminal {
+        Some((cause, elapsed)) => {
+            eprintln!("OBSERVED: the stream reported {cause} after {elapsed:?}");
+        }
+        None => eprintln!("OBSERVED: the stream never reported a cancellation"),
+    }
 
     match wait_for_idle(channel, Duration::from_secs(60)).await {
         Some(elapsed) => {
-            eprintln!("OBSERVED: work stopped {elapsed:?} after abandoning the request in prefill")
+            eprintln!("OBSERVED: engine work stopped {elapsed:?} after the stream reported it")
         }
         None => eprintln!(
-            "OBSERVED: still working {:?} after abandoning the request in prefill;              this engine does NOT observe cancellation before the first token",
-            abandoned_at.elapsed()
+            "OBSERVED: still working {:?} after cancelling in prefill",
+            requested_at.elapsed()
         ),
     }
 
@@ -674,35 +687,36 @@ fn medium_prompt_generative_request(marker: &str) -> GenerateTextRequest {
 #[tokio::test]
 #[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn how_late_a_prefill_cancellation_is_actually_honoured() {
-    // Bounds the worst case. If abandoning during prefill costs the whole request
+    // Bounds the worst case. If cancelling during prefill costs the whole request
     // rather than the rest of prefill, then a cancelled request holds its slot for
-    // as long as an uncancelled one, and cancellation buys nothing at all here.
+    // as long as an uncancelled one and cancellation buys nothing here.
     let Some(backend) = running_backend().await else {
         return;
     };
     let channel = backend.channel();
 
-    // Baseline: the same request, undisturbed.
+    // Baseline: the same shape of request, undisturbed.
     let baseline_start = Instant::now();
-    let mut undisturbed = stream(
+    let (_baseline, mut undisturbed) = begin(
         channel,
         &medium_prompt_generative_request("quick"),
         RequestId::from_raw(20),
-    )
-    .await
-    .expect("opens");
-    let opened_after = baseline_start.elapsed();
+    );
+    let mut first_delta = None;
     let mut deltas = 0usize;
     while let Some(item) = undisturbed.next().await {
         if let Ok(GenerationEvent::TextDelta { .. }) = item {
+            if first_delta.is_none() {
+                first_delta = Some(baseline_start.elapsed());
+            }
             deltas += 1;
         }
     }
     let baseline_total = baseline_start.elapsed();
     assert!(deltas > 0, "the comparison needs a request that generates");
     eprintln!(
-        "BASELINE: prefill ended (response began) at {opened_after:?}, \
-         {deltas} deltas, whole request {baseline_total:?}"
+        "BASELINE: prefill ended at {first_delta:?}, {deltas} deltas, \
+         whole request {baseline_total:?}"
     );
     assert!(
         wait_for_idle(channel, Duration::from_secs(30))
@@ -711,40 +725,35 @@ async fn how_late_a_prefill_cancellation_is_actually_honoured() {
         "the slot never settled before the second half of the test"
     );
 
-    // Now the same request, abandoned as soon as the engine picks it up.
-    let request = medium_prompt_generative_request("nimble");
-    let mut pending = Box::pin(stream(channel, &request, RequestId::from_raw(21)));
+    // Now the same request, cancelled as soon as the engine picks it up. A
+    // distinct prompt, because this engine reuses cached prompt prefixes and a
+    // repeat would skip the prefill this test depends on.
+    let (handle, mut generation) = begin(
+        channel,
+        &medium_prompt_generative_request("nimble"),
+        RequestId::from_raw(21),
+    );
     let started = Instant::now();
     let mut became_busy = None;
-    let opened = loop {
-        tokio::select! {
-            outcome = &mut pending => break Some(outcome),
-            () = tokio::time::sleep(Duration::from_millis(50)) => {
-                if any_slot_busy(channel).await == Some(true) {
-                    became_busy = Some(started.elapsed());
-                    break None;
-                }
-                if started.elapsed() > Duration::from_secs(30) {
-                    break None;
-                }
-            }
+    while started.elapsed() < Duration::from_secs(30) {
+        if any_slot_busy(channel).await == Some(true) {
+            became_busy = Some(started.elapsed());
+            break;
         }
-    };
-    assert!(
-        opened.is_none(),
-        "prefill finished before it could be interrupted"
-    );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     eprintln!("prefill observably underway after {became_busy:?}");
 
-    let abandoned_at = Instant::now();
-    drop(pending);
+    let requested_at = Instant::now();
+    handle.request_cancellation(CancellationCause::User);
+    while generation.next().await.is_some() {}
 
     match wait_for_idle(channel, Duration::from_secs(120)).await {
-        Some(elapsed) => {
-            let held = abandoned_at.elapsed();
+        Some(_) => {
+            let held = requested_at.elapsed();
             eprintln!(
-                "OBSERVED: slot freed {elapsed:?} after abandoning during prefill. \
-                 Prefill alone was {opened_after:?}; the whole request was {baseline_total:?}."
+                "OBSERVED: slot freed {held:?} after cancelling during prefill. \
+                 Prefill alone was {first_delta:?}; the whole request was {baseline_total:?}."
             );
             if held < baseline_total.mul_f32(0.6) {
                 eprintln!(

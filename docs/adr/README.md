@@ -21,6 +21,7 @@ Evidence labels follow the project claim discipline used elsewhere in `docs/`:
 | [0006](0006-general-model-runtime-not-an-llm-runtime.md) | A general model runtime, not a language-model runtime | Accepted |
 | [0007](0007-chat-is-not-the-inference-primitive.md) | Chat is an application abstraction, not the inference primitive | Accepted |
 | [0008](0008-minimal-portable-generation-parameters.md) | Only portable generation parameters are normalised | Accepted |
+| [0009](0009-the-runtime-owns-requests-not-streams.md) | The runtime owns requests, and a stream is only how one is observed | Accepted |
 
 ## Open decisions
 
@@ -36,6 +37,8 @@ Recorded here so they are not lost between records.
 | Target hardware profile, which no document currently records | Needed before memory-aware scheduling | [research distillation](../research/runtime-landscape-distillation.md) |
 | Where the chat template renderer lives, and how its correctness is established | Yes, before the first conversation input. Raw continuation needs no template, so it does not block text generation itself | [0007](0007-chat-is-not-the-inference-primitive.md) |
 | How backend-native controls are reached without joining the portable parameter set | No, not needed to generate text | [0008](0008-minimal-portable-generation-parameters.md) |
+| Concurrency limits and queueing, now that requests have identity | No, nothing queues yet | [0009](0009-the-runtime-owns-requests-not-streams.md) |
+| Whether the runtime should observe that a backend actually stopped, rather than only that its transport was released | No, measured per backend for now | [0009](0009-the-runtime-owns-requests-not-streams.md) |
 
 ## Resolved since being raised
 
@@ -43,4 +46,5 @@ Recorded here so they are not lost between records.
 | --- | --- |
 | Local client transport and its authentication model, deferred by ADR-0001 | [0004](0004-local-transport-and-surface-split.md) |
 | Which generation parameters the runtime normalises | [0008](0008-minimal-portable-generation-parameters.md) |
+| What `GenerationEvent::Started` marks, corrected after measurement | [0009](0009-the-runtime-owns-requests-not-streams.md) |
 | Worker supervision contract: readiness, hang detection, draining, restart policy, orphan cleanup, deferred by ADR-0002 | Implemented in `mehoy-core::worker`; orphan cleanup verified on Windows only, tracked in issue 4 |

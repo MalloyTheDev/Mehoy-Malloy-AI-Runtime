@@ -23,7 +23,10 @@ use std::fmt;
 use mehoy_backend_llama::{
     BackendError, LlamaCppBackend, LlamaCppWorkerSpec, ModelDescriptor, RunningBackend,
 };
-use mehoy_core::id::{IdAllocator, WorkerId};
+use mehoy_core::cancel::{
+    CancellationCause, CancellationStrategy, RequestBudget, RequestHandle, RequestState,
+};
+use mehoy_core::id::{IdAllocator, RequestId, WorkerId};
 use mehoy_core::inference::{
     self, EmbedRequest, EmbeddingResult, GenerateTextRequest, GenerationResult, GenerationStream,
 };
@@ -128,6 +131,65 @@ impl From<RegistryError> for LoadError {
     }
 }
 
+/// A request the runtime has accepted, and the stream that observes it.
+///
+/// The identifier is separate from the stream on purpose. Cancelling needs only
+/// the identifier, so a caller can hand the stream elsewhere, or drop it, and
+/// still stop the work.
+#[derive(Debug)]
+pub struct GenerationRequest {
+    pub request_id: RequestId,
+    pub stream: GenerationStream,
+}
+
+/// What asking to stop a request achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The request was running and has now been told to stop.
+    ///
+    /// Not a claim that it has stopped. The stream reports that when it happens.
+    Requested,
+    /// The request was already stopping when this call arrived.
+    AlreadyStopping { cause: CancellationCause },
+    /// The request had already ended.
+    AlreadyFinished { state: RequestState },
+}
+
+impl fmt::Display for CancelOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requested => f.write_str("the request has been asked to stop"),
+            Self::AlreadyStopping { cause } => {
+                write!(f, "the request was already stopping ({cause})")
+            }
+            Self::AlreadyFinished { state } => write!(f, "the request had already {state}"),
+        }
+    }
+}
+
+/// Why a request could not be cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelError {
+    /// This instance has no record of the request.
+    ///
+    /// Either it never existed here, or it ended long enough ago to have been
+    /// forgotten. The two are not distinguished, because the runtime does not keep
+    /// a permanent history of every request it has served.
+    Unknown { request_id: RequestId },
+}
+
+impl fmt::Display for CancelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown { request_id } => {
+                write!(f, "no request {request_id} is running on this instance")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CancelError {}
+
 /// A running instance together with the backend serving it.
 #[derive(Debug)]
 pub struct LoadedModel {
@@ -138,6 +200,12 @@ pub struct LoadedModel {
     /// Owned here because nothing above the loader allocates one yet. When a
     /// request pipeline exists, identity will arrive with the request instead.
     requests: IdAllocator,
+    /// Every request this instance has accepted and not yet seen end.
+    ///
+    /// The runtime holds these so a request can be stopped by identity, without
+    /// needing to know who is reading its output or whether anyone still is.
+    /// ADR-0009 records why that ownership sits here rather than in the stream.
+    active: std::sync::Mutex<std::collections::HashMap<RequestId, RequestHandle>>,
 }
 
 impl LoadedModel {
@@ -279,31 +347,44 @@ impl LoadedModel {
         Ok(result)
     }
 
-    /// Continues text, delivering it incrementally.
+    /// Begins continuing text, delivering it incrementally.
     ///
-    /// Parameters are validated before anything is sent, exactly as they are for
-    /// the non-streaming path, so an unusable value is refused the same way
-    /// regardless of how the caller asked for output.
+    /// Returns as soon as the runtime owns the request. It does not wait for the
+    /// backend, which on a measured engine can spend more than ten seconds reading
+    /// a large prompt before answering at all. Waiting for that would leave the
+    /// caller holding nothing to cancel during exactly the period when cancelling
+    /// matters most. ADR-0009 records the reasoning.
     ///
-    /// Returning `Ok` means the backend accepted the request and the stream is
-    /// established. It does not mean generation succeeded: a backend that dies
-    /// after one delta returns a stream that fails, which is the distinction the
-    /// event sequence exists to express.
-    ///
-    /// This does not verify the capability. Verification requires observing the
-    /// whole stream, which only the consumer can do, so a caller that wants the
-    /// attempt to count as evidence passes the drained stream to
-    /// [`LoadedModel::record_generation_stream`].
+    /// Because nothing is awaited here, a backend refusal is not reported by this
+    /// call. It arrives through the stream, alongside every other way the request
+    /// can fail.
     ///
     /// # Errors
     ///
-    /// Returns [`LoadError::NotUsable`] when the instance is not ready,
-    /// [`LoadError::InvalidRequest`] when a parameter cannot be honoured, and
-    /// [`LoadError::Inference`] when the backend refuses to begin.
-    pub async fn generate_text_stream(
+    /// Returns [`LoadError::NotUsable`] when the instance is not ready and
+    /// [`LoadError::InvalidRequest`] when a parameter cannot be honoured. Both are
+    /// decided before a request is accepted, so neither creates one.
+    pub fn generate_stream(
         &self,
         request: &GenerateTextRequest,
-    ) -> Result<GenerationStream, LoadError> {
+    ) -> Result<GenerationRequest, LoadError> {
+        self.generate_stream_within(request, RequestBudget::default())
+    }
+
+    /// The same, with an explicit budget.
+    ///
+    /// Separate so the default is one value in one place rather than a constant
+    /// repeated at call sites, and so a test can choose a budget it can actually
+    /// wait for.
+    ///
+    /// # Errors
+    ///
+    /// As [`LoadedModel::generate_stream`].
+    pub fn generate_stream_within(
+        &self,
+        request: &GenerateTextRequest,
+        budget: RequestBudget,
+    ) -> Result<GenerationRequest, LoadError> {
         if !self.instance.state().is_usable() {
             return Err(LoadError::NotUsable {
                 state: self.instance.state().to_string(),
@@ -317,11 +398,100 @@ impl LoadedModel {
                 detail: invalid.to_string(),
             })?;
 
-        mehoy_backend_llama::stream(self.backend.channel(), request, self.requests.request())
-            .await
-            .map_err(|source| LoadError::Inference {
-                detail: source.to_string(),
+        let handle = RequestHandle::new(self.requests.request());
+        let request_id = handle.id();
+        self.register(handle.clone());
+
+        let stream =
+            mehoy_backend_llama::start_generation(self.backend.channel(), request, handle, budget);
+
+        Ok(GenerationRequest { request_id, stream })
+    }
+
+    /// Asks a request to stop.
+    ///
+    /// Returns once the request has been told to stop, which is not the same as
+    /// its having stopped. The backend may keep working afterwards, and on the
+    /// measured engine it does when it is still reading its input. The request's
+    /// stream reports [`inference::GenerationEvent::Cancelled`] when execution has
+    /// actually ended.
+    ///
+    /// Addressed by identity rather than by stream, so a request can be stopped by
+    /// something that is not reading it, and so dropping a stream does not silently
+    /// mean the same thing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CancelError::Unknown`] when this instance has no such request.
+    /// A request that has already ended is not an error; it is reported as such.
+    pub fn cancel(&self, request_id: RequestId) -> Result<CancelOutcome, CancelError> {
+        let handle = {
+            let mut active = self.active();
+            active.retain(|_, handle| !handle.is_terminal());
+            active.get(&request_id).cloned()
+        };
+
+        let Some(handle) = handle else {
+            return Err(CancelError::Unknown { request_id });
+        };
+
+        if handle.is_terminal() {
+            return Ok(CancelOutcome::AlreadyFinished {
+                state: handle.state(),
+            });
+        }
+
+        if handle.request_cancellation(CancellationCause::User) {
+            Ok(CancelOutcome::Requested)
+        } else if handle.is_terminal() {
+            Ok(CancelOutcome::AlreadyFinished {
+                state: handle.state(),
             })
+        } else {
+            Ok(CancelOutcome::AlreadyStopping {
+                cause: handle
+                    .cancellation_cause()
+                    .unwrap_or(CancellationCause::User),
+            })
+        }
+    }
+
+    /// How many accepted requests have not yet been seen to end.
+    ///
+    /// Ended requests are dropped as they are noticed rather than tracked forever,
+    /// so this is a live count and not a total.
+    #[must_use]
+    pub fn active_requests(&self) -> usize {
+        let mut active = self.active();
+        active.retain(|_, handle| !handle.is_terminal());
+        active.len()
+    }
+
+    /// The state of one request, if this instance still knows about it.
+    #[must_use]
+    pub fn request_state(&self, request_id: RequestId) -> Option<RequestState> {
+        self.active().get(&request_id).map(RequestHandle::state)
+    }
+
+    /// How this instance's backend is able to stop work.
+    #[must_use]
+    pub fn cancellation_strategy(&self) -> CancellationStrategy {
+        mehoy_backend_llama::cancellation_strategy()
+    }
+
+    fn register(&self, handle: RequestHandle) {
+        let mut active = self.active();
+        active.retain(|_, existing| !existing.is_terminal());
+        active.insert(handle.id(), handle);
+    }
+
+    fn active(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<RequestId, RequestHandle>> {
+        // Never held across an await, so a panic cannot poison it in practice.
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Records what a drained stream demonstrated, promoting the capability if it
@@ -333,7 +503,8 @@ impl LoadedModel {
     /// least one non-empty delta. An opened stream proves the backend accepted a
     /// request, and a first delta proves it began answering, but neither survives
     /// the backend dying immediately afterwards. Evidence a later event could
-    /// contradict is not evidence.
+    /// contradict is not evidence, and a cancelled request is not evidence either:
+    /// it was stopped before the backend said it had finished.
     ///
     /// A stream that failed leaves the capability untouched rather than clearing
     /// it. A refusal is not proof of absence, and this is a record of what has been
@@ -491,6 +662,7 @@ impl ModelLoader {
             instance,
             backend,
             requests: IdAllocator::default(),
+            active: std::sync::Mutex::default(),
         })
     }
 }

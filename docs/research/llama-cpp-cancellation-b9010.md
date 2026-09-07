@@ -131,3 +131,23 @@ harness boxes these futures.
    only by terminating the worker, or not at all, rather than assuming the first.
 4. Because the response is withheld until prefill ends, request identity and
    cancellation must exist before the stream does.
+
+## Measured again after the runtime took ownership of requests
+
+Re-run once cancellation was addressed to a request rather than to a stream, which
+is the arrangement ADR-0009 describes. The findings are unchanged, and one gap is
+now visible as a number rather than as a prediction.
+
+| | |
+| --- | --- |
+| Stream reports `Cancelled` after | 289 us |
+| Engine work actually stops after | 10.17 s |
+
+`[VERIFIED]` Cancelling during input processing releases the transport at once and
+the engine keeps working until it has finished reading the prompt. The terminal
+event therefore means the runtime has stopped, not that the engine has.
+
+`[VERIFIED]` The bound is unchanged: cancelling 311 ms into a 3.11 s input phase
+freed the slot after 3.18 s, against 10.22 s for the same request undisturbed. The
+cost of cancelling during input processing is the remainder of that phase, not the
+whole request.

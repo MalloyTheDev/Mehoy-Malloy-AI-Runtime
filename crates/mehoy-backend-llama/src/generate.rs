@@ -29,6 +29,7 @@
 //! value that happens to match today's default.
 
 use std::fmt;
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -37,7 +38,9 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 
-use mehoy_core::id::RequestId;
+use mehoy_core::cancel::{
+    CancellationCause, CancellationStrategy, CancellationToken, RequestBudget, RequestHandle,
+};
 use mehoy_core::inference::{
     FinishReason, GenerateTextRequest, GenerationResult, GenerationSink, GenerationStream,
     GenerationStreamError, GenerationSummary, GenerationUsage, generation_stream,
@@ -304,35 +307,55 @@ async fn post(
 /// The marker this engine sends after its final event.
 const DONE_MARKER: &str = "[DONE]";
 
-/// How long the backend may go silent mid-stream before the stream is abandoned.
+/// How this engine can be made to stop work.
 ///
-/// A backend that stops sending without closing the connection is
-/// indistinguishable from one that has hung, and waiting forever turns that into a
-/// leaked task and a consumer that never learns anything. This is a liveness
-/// ceiling, not a token budget, and not cancellation.
-const IDLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+/// Build 9010 exposes no cancellation route: `DELETE /v1/stream` and every
+/// neighbouring path answer 404. Closing the request's transport is the only
+/// signal it responds to, and it does respond to it, which was measured rather
+/// than assumed. See `docs/research/llama-cpp-cancellation-b9010.md`.
+///
+/// This is why every generation gets its own connection rather than sharing a
+/// pooled one. If closing a connection is how a request is stopped, then a
+/// connection shared between requests cannot be closed to stop one of them.
+#[must_use]
+pub const fn cancellation_strategy() -> CancellationStrategy {
+    CancellationStrategy::ConnectionAbort
+}
 
-/// Starts a streaming generation against a running backend.
+/// Everything the execution task needs, owned.
 ///
-/// Resolves once the backend has accepted the request and the response has begun,
-/// which is exactly what [`GenerationEvent::Started`] claims. Content arrives
-/// afterwards through the returned stream.
+/// The task outlives the call that started it, so it cannot borrow the channel.
+struct Job {
+    address: std::net::SocketAddr,
+    host: String,
+    secret: String,
+    body: Result<Vec<u8>, String>,
+}
+
+/// Starts a streaming generation and returns immediately.
 ///
-/// Backpressure is real: the returned stream has a bounded buffer, and this
-/// adapter stops reading the backend's socket once that buffer is full, so a slow
-/// consumer slows the backend rather than accumulating in this process. Dropping
-/// the stream stops the reader at its next event.
+/// Returns as soon as the runtime owns the request, which is what
+/// [`mehoy_core::inference::GenerationEvent::Started`] now claims. Connecting, sending, waiting out
+/// input processing, and reading the response all happen behind the returned
+/// stream.
 ///
-/// # Errors
+/// This deliberately does not wait for the backend to answer. On the measured
+/// engine a large prompt delays the first response header by over ten seconds,
+/// and a call that waited for it would offer no way to stop the request during
+/// precisely the period when stopping it matters most. ADR-0009 records the
+/// reasoning.
 ///
-/// Returns [`GenerationStreamError`] when the request cannot be delivered or the
-/// backend refuses it outright. A failure occurring after the stream is
-/// established is reported through the stream instead.
-pub async fn stream(
+/// Cancelling `cancel` closes this request's transport and ends the stream with
+/// [`mehoy_core::inference::GenerationEvent::Cancelled`] once execution has actually
+/// stopped. Because
+/// the connection belongs to this request alone, that cannot disturb another
+/// request or the worker.
+pub fn start_generation(
     channel: &BackendChannel,
     request: &GenerateTextRequest,
-    request_id: RequestId,
-) -> Result<GenerationStream, GenerationStreamError> {
+    handle: RequestHandle,
+    budget: RequestBudget,
+) -> GenerationStream {
     let parameters = &request.parameters;
     let body = serde_json::to_vec(&WireRequest {
         prompt: request.input.as_str(),
@@ -342,93 +365,155 @@ pub async fn stream(
         stop: &parameters.stop,
         stream: true,
     })
-    .map_err(|err| GenerationStreamError::Transport {
-        detail: format!("cannot encode the request: {err}"),
-    })?;
+    .map_err(|err| format!("cannot encode the request: {err}"));
 
-    let opened = tokio::time::timeout(REQUEST_BUDGET, open(channel, body))
-        .await
-        .map_err(|_| GenerationStreamError::Transport {
-            detail: format!(
-                "the backend did not respond within {}s",
-                REQUEST_BUDGET.as_secs()
-            ),
-        })??;
+    let job = Job {
+        address: channel.address(),
+        host: channel.host(),
+        secret: channel.secret().expose().to_owned(),
+        body,
+    };
 
-    let (sink, stream) = generation_stream(request_id);
-    tokio::spawn(read(opened, sink));
-    Ok(stream)
+    let cancel = handle.token().clone();
+    let (sink, stream) = generation_stream(handle);
+    tokio::spawn(execute(job, sink, cancel, budget));
+    stream
 }
 
-/// A backend response whose body has not been read yet.
-struct OpenStream {
-    body: hyper::body::Incoming,
-    connection: tokio::task::JoinHandle<()>,
-}
-
-/// Sends the request and returns once the response has begun.
+/// Runs `work` unless cancellation arrives first or the budget runs out.
 ///
-/// A non-success status is resolved here rather than through the stream. A request
-/// the backend never accepted has no stream to report through, and delivering it
-/// as a mid-stream failure would imply generation had started.
-async fn open(
-    channel: &BackendChannel,
-    body: Vec<u8>,
-) -> Result<OpenStream, GenerationStreamError> {
-    let transport = TcpStream::connect(channel.address()).await.map_err(|err| {
-        GenerationStreamError::Transport {
-            detail: err.to_string(),
-        }
-    })?;
+/// Biased towards cancellation, so a request cancelled before its work has made
+/// progress stops deterministically rather than depending on which future the
+/// scheduler happened to poll.
+///
+/// The idle budget covers waiting for the backend to say anything at all, not
+/// only the gaps between things it has said. On the measured engine the longest
+/// silence in a request is the one before the first response header, while the
+/// prompt is being read, so a budget that started only once the response had begun
+/// would leave the longest wait unbounded and a backend that never answered at all
+/// would hang forever.
+async fn within<F>(
+    cancel: &CancellationToken,
+    budget: Duration,
+    work: F,
+) -> Result<F::Output, CancellationCause>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        cause = cancel.cancelled() => Err(cause),
+        outcome = tokio::time::timeout(budget, work) => match outcome {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                // Silence becomes a cancellation with its own cause rather than a
+                // separate stopping mechanism.
+                cancel.cancel(CancellationCause::StreamIdleTimeout);
+                Err(cancel
+                    .cause()
+                    .unwrap_or(CancellationCause::StreamIdleTimeout))
+            }
+        },
+    }
+}
 
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(transport))
-        .await
-        .map_err(|err| GenerationStreamError::Transport {
-            detail: err.to_string(),
-        })?;
-    let connection = tokio::spawn(async move {
+/// Carries out one generation, ending the sink exactly once.
+async fn execute(job: Job, sink: GenerationSink, cancel: CancellationToken, budget: RequestBudget) {
+    let body = match job.body {
+        Ok(body) => body,
+        Err(detail) => {
+            sink.fail(GenerationStreamError::Transport { detail }).await;
+            return;
+        }
+    };
+
+    // A connection per request, never pooled, because closing it is how this
+    // backend is told to stop.
+    let transport = match within(&cancel, budget.stream_idle, TcpStream::connect(job.address)).await
+    {
+        Err(cause) => return sink.cancel(cause).await,
+        Ok(Err(err)) => {
+            return sink
+                .fail(GenerationStreamError::Transport {
+                    detail: err.to_string(),
+                })
+                .await;
+        }
+        Ok(Ok(transport)) => transport,
+    };
+
+    let handshake = hyper::client::conn::http1::handshake(TokioIo::new(transport));
+    let (mut sender, connection) = match within(&cancel, budget.stream_idle, handshake).await {
+        Err(cause) => return sink.cancel(cause).await,
+        Ok(Err(err)) => {
+            return sink
+                .fail(GenerationStreamError::Transport {
+                    detail: err.to_string(),
+                })
+                .await;
+        }
+        Ok(Ok(parts)) => parts,
+    };
+    let pump = tokio::spawn(async move {
         let _ = connection.await;
     });
 
     let request = Request::builder()
         .method("POST")
         .uri(COMPLETIONS_PATH)
-        .header(header::HOST, channel.host())
+        .header(header::HOST, job.host)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "text/event-stream")
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", channel.secret().expose()),
-        )
-        .body(Full::new(Bytes::from(body)))
-        .map_err(|err| GenerationStreamError::Transport {
-            detail: err.to_string(),
-        })?;
-
-    let response = match sender.send_request(request).await {
-        Ok(response) => response,
+        .header(header::AUTHORIZATION, format!("Bearer {}", job.secret))
+        .body(Full::new(Bytes::from(body)));
+    let request = match request {
+        Ok(request) => request,
         Err(err) => {
-            connection.abort();
-            return Err(GenerationStreamError::Transport {
-                detail: err.to_string(),
-            });
+            pump.abort();
+            return sink
+                .fail(GenerationStreamError::Transport {
+                    detail: err.to_string(),
+                })
+                .await;
         }
     };
 
+    // The long wait. For a large prompt the backend reads all of it before
+    // answering, so this is where a cancellation most often lands.
+    let response = match within(&cancel, budget.stream_idle, sender.send_request(request)).await {
+        Err(cause) => {
+            pump.abort();
+            return sink.cancel(cause).await;
+        }
+        Ok(Err(err)) => {
+            pump.abort();
+            return sink
+                .fail(GenerationStreamError::Transport {
+                    detail: err.to_string(),
+                })
+                .await;
+        }
+        Ok(Ok(response)) => response,
+    };
+    sink.handle().mark_running();
+
     let status = response.status();
     if !status.is_success() {
-        let detail = response.into_body().collect().await.map_or_else(
-            |err| err.to_string(),
-            |collected| classify(status, &collected.to_bytes()).to_string(),
-        );
-        connection.abort();
-        return Err(GenerationStreamError::Refused { detail });
+        let collected = within(&cancel, budget.stream_idle, response.into_body().collect()).await;
+        pump.abort();
+        return match collected {
+            Err(cause) => sink.cancel(cause).await,
+            Ok(outcome) => {
+                let detail = outcome.map_or_else(
+                    |err| err.to_string(),
+                    |body| classify(status, &body.to_bytes()).to_string(),
+                );
+                sink.fail(GenerationStreamError::Refused { detail }).await
+            }
+        };
     }
 
-    Ok(OpenStream {
-        body: response.into_body(),
-        connection,
-    })
+    read(response.into_body(), sink, cancel, budget, pump).await;
 }
 
 /// Drives the response body until the generation ends.
@@ -436,26 +521,39 @@ async fn open(
 /// Every exit path ends the sink exactly once, so a consumer always learns an
 /// outcome rather than watching the stream simply stop. The one exception is a
 /// consumer that has gone away, which has nothing left to be told.
-async fn read(opened: OpenStream, mut sink: GenerationSink) {
-    let OpenStream {
-        mut body,
-        connection,
-    } = opened;
+async fn read(
+    mut body: hyper::body::Incoming,
+    mut sink: GenerationSink,
+    cancel: CancellationToken,
+    budget: RequestBudget,
+    pump: tokio::task::JoinHandle<()>,
+) {
     let mut decoder = SseDecoder::default();
     let mut terminal: Option<GenerationSummary> = None;
 
-    let outcome: Result<EndOfBody, GenerationStreamError> = 'body: loop {
-        let frame = match tokio::time::timeout(IDLE_BUDGET, body.frame()).await {
+    let outcome: Result<EndOfBody, Interruption> = 'body: loop {
+        let waited = tokio::select! {
+            biased;
+            cause = cancel.cancelled() => break 'body Err(Interruption::Cancelled(cause)),
+            frame = tokio::time::timeout(budget.stream_idle, body.frame()) => frame,
+        };
+
+        let frame = match waited {
+            // Silence is indistinguishable from a hang, so it becomes a
+            // cancellation with its own cause rather than a separate mechanism.
             Err(_) => {
-                break 'body Err(GenerationStreamError::UnexpectedEnd {
-                    detail: format!("the backend sent nothing for {}s", IDLE_BUDGET.as_secs()),
-                });
+                cancel.cancel(CancellationCause::StreamIdleTimeout);
+                break 'body Err(Interruption::Cancelled(
+                    cancel
+                        .cause()
+                        .unwrap_or(CancellationCause::StreamIdleTimeout),
+                ));
             }
             Ok(None) => break 'body Ok(EndOfBody::Closed),
             Ok(Some(Err(err))) => {
-                break 'body Err(GenerationStreamError::Transport {
+                break 'body Err(Interruption::Failed(GenerationStreamError::Transport {
                     detail: err.to_string(),
-                });
+                }));
             }
             Ok(Some(Ok(frame))) => frame,
         };
@@ -466,7 +564,11 @@ async fn read(opened: OpenStream, mut sink: GenerationSink) {
 
         let payloads = match decoder.push(chunk) {
             Ok(payloads) => payloads,
-            Err(detail) => break 'body Err(GenerationStreamError::MalformedEvent { detail }),
+            Err(detail) => {
+                break 'body Err(Interruption::Failed(
+                    GenerationStreamError::MalformedEvent { detail },
+                ));
+            }
         };
 
         for payload in payloads {
@@ -477,9 +579,11 @@ async fn read(opened: OpenStream, mut sink: GenerationSink) {
             let parsed: WireResponse = match serde_json::from_str(&payload) {
                 Ok(parsed) => parsed,
                 Err(err) => {
-                    break 'body Err(GenerationStreamError::MalformedEvent {
-                        detail: describe(&err, &payload),
-                    });
+                    break 'body Err(Interruption::Failed(
+                        GenerationStreamError::MalformedEvent {
+                            detail: describe(&err, &payload),
+                        },
+                    ));
                 }
             };
 
@@ -500,16 +604,20 @@ async fn read(opened: OpenStream, mut sink: GenerationSink) {
             }
 
             if !sink.delta(choice.text).await {
-                connection.abort();
+                pump.abort();
                 return;
             }
         }
     };
 
-    connection.abort();
+    // Dropping the body and stopping the connection closes this request's socket,
+    // which is what actually tells the backend to stop.
+    drop(body);
+    pump.abort();
 
     match outcome {
-        Err(error) => sink.fail(error).await,
+        Err(Interruption::Cancelled(cause)) => sink.cancel(cause).await,
+        Err(Interruption::Failed(error)) => sink.fail(error).await,
         Ok(end) => match terminal {
             Some(summary) => sink.complete(summary).await,
             None => {
@@ -530,6 +638,12 @@ async fn read(opened: OpenStream, mut sink: GenerationSink) {
             }
         },
     }
+}
+
+/// Why reading stopped before the response ended on its own.
+enum Interruption {
+    Cancelled(CancellationCause),
+    Failed(GenerationStreamError),
 }
 
 /// How the response body stopped producing events.
