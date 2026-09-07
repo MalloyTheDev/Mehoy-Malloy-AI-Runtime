@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Lock file is committed for binary crates, so it is not ignored here.
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
