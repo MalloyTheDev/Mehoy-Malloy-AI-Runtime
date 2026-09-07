@@ -39,12 +39,16 @@ get right before anything else is built on top of it.
 - Embeddings, end to end: a real authenticated request through the backend adapter,
   structurally validated, promoting the capability from indicated to verified only
   on success
+- Loading a text-generative model through the same call, transaction, and capability
+  rules as an embedding model, with the backend choosing its own launch mode from
+  the artifact's metadata
 
 **Not implemented**
 
-- Text generation, and therefore no token streaming or cancellation
-- Any model class other than text embeddings. Nothing prevents them; nothing
-  implements them yet
+- Performing text generation. A generative model loads and is reachable; no
+  generation has been requested, so no token streaming or cancellation either
+- Any model class beyond text embeddings and text generation. Nothing prevents them;
+  nothing implements them yet
 - Taking ownership of an artifact into a managed store. Registration records where
   a file is; it never copies or moves it
 - Backend installation or download. The executable is configured explicitly
