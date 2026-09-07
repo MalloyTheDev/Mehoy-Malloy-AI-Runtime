@@ -89,7 +89,7 @@ fn run(endpoint: Option<String>) -> ExitCode {
     };
 
     runtime.block_on(async move {
-        let endpoint = match Endpoint::bind(&address) {
+        let endpoint = match Endpoint::bind(&address).await {
             Ok(endpoint) => endpoint,
             Err(err @ EndpointError::AlreadyRunning { .. }) => {
                 eprintln!("mehoyd: {err}");

@@ -48,7 +48,9 @@ where
     F: FnOnce(Client) -> Fut,
     Fut: Future<Output = T>,
 {
-    let endpoint = Endpoint::bind(address).expect("daemon binds its endpoint");
+    let endpoint = Endpoint::bind(address)
+        .await
+        .expect("daemon binds its endpoint");
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let served = tokio::spawn(async move {
         mehoy_daemon::serve(endpoint, async {
@@ -136,9 +138,9 @@ async fn unknown_route_is_reported_as_a_daemon_error() {
 #[tokio::test]
 async fn a_second_daemon_is_refused() {
     let address = unique_address("duplicate");
-    let _first = Endpoint::bind(&address).expect("first daemon binds");
+    let _first = Endpoint::bind(&address).await.expect("first daemon binds");
 
-    match Endpoint::bind(&address) {
+    match Endpoint::bind(&address).await {
         Err(EndpointError::AlreadyRunning { address: reported }) => {
             assert_eq!(reported, address);
         }
@@ -222,7 +224,7 @@ async fn a_regular_file_at_the_endpoint_path_is_never_deleted() {
         .expect("test directory is creatable");
     std::fs::write(&path, b"not a socket").expect("occupant file is written");
 
-    match Endpoint::bind(&address) {
+    match Endpoint::bind(&address).await {
         Err(EndpointError::UnexpectedOccupant { .. }) => {}
         Err(other) => panic!("expected UnexpectedOccupant, got {other}"),
         Ok(_) => panic!("binding over a regular file must be refused"),

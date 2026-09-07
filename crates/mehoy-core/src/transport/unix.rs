@@ -10,9 +10,11 @@ use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::net::{UnixListener, UnixStream};
 
+use super::trace::{self, EndpointEvent, Stage};
 use super::{EndpointAddress, EndpointError};
 
 /// Connected socket carrying HTTP between a client and the daemon.
@@ -155,6 +157,8 @@ pub struct Endpoint {
     listener: UnixListener,
     address: EndpointAddress,
     path: PathBuf,
+    /// Shared copy of the address for trace events.
+    trace_address: Arc<str>,
 }
 
 impl Endpoint {
@@ -167,7 +171,7 @@ impl Endpoint {
     /// directory is not private to this user, and
     /// [`EndpointError::UnexpectedOccupant`] when the path holds something that
     /// must not be removed.
-    pub fn bind(address: &EndpointAddress) -> Result<Self, EndpointError> {
+    pub async fn bind(address: &EndpointAddress) -> Result<Self, EndpointError> {
         let path = PathBuf::from(address.as_str());
         let dir = path
             .parent()
@@ -176,10 +180,16 @@ impl Endpoint {
                 reason: format!("endpoint path {} has no parent directory", path.display()),
             })?;
 
+        let trace_address: Arc<str> = Arc::from(address.as_str());
+
         ensure_private_directory(dir)?;
         clear_stale_socket(&path, address)?;
 
         let listener = UnixListener::bind(&path).map_err(|err| {
+            trace::emit(
+                &EndpointEvent::new(Stage::InstanceCreated, &trace_address, 0, false)
+                    .with_error(&err),
+            );
             if err.kind() == io::ErrorKind::AddrInUse {
                 EndpointError::AlreadyRunning {
                     address: address.clone(),
@@ -188,11 +198,18 @@ impl Endpoint {
                 EndpointError::Io(err)
             }
         })?;
+        trace::emit(&EndpointEvent::new(
+            Stage::InstanceCreated,
+            &trace_address,
+            0,
+            true,
+        ));
 
         Ok(Self {
             listener,
             address: address.clone(),
             path,
+            trace_address,
         })
     }
 
@@ -202,7 +219,24 @@ impl Endpoint {
     ///
     /// Returns any error reported while accepting.
     pub async fn accept(&mut self) -> io::Result<Stream> {
-        let (stream, _addr) = self.listener.accept().await?;
+        trace::emit(&EndpointEvent::new(
+            Stage::ConnectWaitStarted,
+            &self.trace_address,
+            0,
+            true,
+        ));
+        let (stream, _addr) = self.listener.accept().await.inspect_err(|err| {
+            trace::emit(
+                &EndpointEvent::new(Stage::AcceptFailed, &self.trace_address, 0, true)
+                    .with_error(err),
+            );
+        })?;
+        trace::emit(&EndpointEvent::new(
+            Stage::ConnectionHandedOff,
+            &self.trace_address,
+            0,
+            true,
+        ));
         Ok(stream)
     }
 
@@ -215,6 +249,12 @@ impl Endpoint {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
+        trace::emit(&EndpointEvent::new(
+            Stage::EndpointClosed,
+            &self.trace_address,
+            0,
+            false,
+        ));
         // Best effort. A failure here leaves a stale socket, which the next
         // startup detects and clears rather than tripping over.
         let _ = fs::remove_file(&self.path);

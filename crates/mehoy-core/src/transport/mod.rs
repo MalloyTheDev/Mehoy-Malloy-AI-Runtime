@@ -20,8 +20,16 @@ use std::io;
 #[cfg_attr(unix, path = "unix.rs")]
 #[cfg_attr(windows, path = "windows.rs")]
 mod platform;
+pub mod trace;
 
 pub use platform::{ClientStream, Endpoint, Stream, connect};
+pub use trace::{EndpointEvent, ErrorFacts, Stage, TRACE_ENV, set_observer};
+
+/// Whether the test-only race amplifier is compiled in.
+///
+/// Exposed so a stress test can assert it is actually enabled, rather than
+/// silently losing its amplification if the feature stops being propagated.
+pub const RACE_AMPLIFIER_ENABLED: bool = cfg!(feature = "race-amplifier");
 
 /// Environment variable that overrides the default endpoint location.
 pub const ENDPOINT_ENV: &str = "MEHOY_ENDPOINT";

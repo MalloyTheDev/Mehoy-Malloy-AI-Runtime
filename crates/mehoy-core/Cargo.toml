@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Test-only. Inserts scheduling yields at endpoint handoff boundaries to widen
+# race windows. Never enable this in a release build; it exists so that timing
+# defects surface in tests instead of in production.
+race-amplifier = []
+
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
 

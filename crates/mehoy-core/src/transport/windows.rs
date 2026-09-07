@@ -17,6 +17,7 @@
 use std::ffi::c_void;
 use std::io;
 use std::ptr;
+use std::sync::Arc;
 
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
 
@@ -32,10 +33,18 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+use super::trace::{self, EndpointEvent, Stage};
 use super::{EndpointAddress, EndpointError};
 
 /// Connected pipe carrying HTTP between a client and the daemon.
 pub type Stream = NamedPipeServer;
+
+/// How long to wait for a pipe name left by a previous daemon to finish tearing
+/// down before giving up on binding it.
+const BIND_LINGER_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long to pause between bind attempts while a pipe name is still lingering.
+const BIND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Buffer sizes advertised when creating a pipe instance. These are hints to the
 /// system, not limits on message size.
@@ -203,6 +212,12 @@ pub struct Endpoint {
     /// The instance waiting for the next client. One is always held so that a
     /// client connecting between two accepts is queued rather than refused.
     pending: Option<NamedPipeServer>,
+    /// Counts listening instances created by this endpoint, so a traced failure
+    /// can be tied to a specific instance rather than to the endpoint as a whole.
+    generation: u64,
+    /// Shared copy of the address for trace events, so emitting one does not
+    /// allocate a fresh string every time.
+    trace_address: Arc<str>,
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -216,28 +231,75 @@ impl std::fmt::Debug for Endpoint {
 impl Endpoint {
     /// Creates the pipe with a descriptor restricting it to the current user.
     ///
+    /// A pipe name that still has instances rejects a `first_pipe_instance`
+    /// creation with `ERROR_ACCESS_DENIED`. That happens for two very different
+    /// reasons, and they must not be reported the same way:
+    ///
+    /// - another daemon is genuinely listening;
+    /// - a daemon just exited and the name has not finished tearing down.
+    ///
+    /// Reporting the second as "already running" would be wrong, and would make
+    /// restarting the daemon fail intermittently. Following the same rule ADR-0004
+    /// applies on Unix, liveness is decided by connecting rather than by existence:
+    /// if a client can connect, a daemon really is there; if it cannot, the name is
+    /// lingering and creation is retried briefly.
+    ///
     /// # Errors
     ///
-    /// Returns [`EndpointError::AlreadyRunning`] when another daemon holds the
-    /// pipe name, and [`EndpointError::Io`] for any other failure.
-    pub fn bind(address: &EndpointAddress) -> Result<Self, EndpointError> {
+    /// Returns [`EndpointError::AlreadyRunning`] when a daemon answers on the pipe,
+    /// and [`EndpointError::Io`] for any other failure.
+    pub async fn bind(address: &EndpointAddress) -> Result<Self, EndpointError> {
         let sid = current_user_sid().map_err(EndpointError::Io)?;
         let sddl = security_descriptor_definition(&sid);
+        let trace_address: Arc<str> = Arc::from(address.as_str());
 
-        let pending = create_instance(address.as_str(), &sddl, true).map_err(|err| {
-            if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
-                EndpointError::AlreadyRunning {
-                    address: address.clone(),
+        let deadline = std::time::Instant::now() + BIND_LINGER_BUDGET;
+        let pending = loop {
+            match create_instance(address.as_str(), &sddl, true) {
+                Ok(instance) => break instance,
+                Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                    trace::emit(
+                        &EndpointEvent::new(Stage::InstanceCreated, &trace_address, 0, false)
+                            .with_error(&err),
+                    );
+                    if ClientOptions::new().open(address.as_str()).is_ok() {
+                        return Err(EndpointError::AlreadyRunning {
+                            address: address.clone(),
+                        });
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(EndpointError::Io(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            format!(
+                                "{address} still has instances after {}s but nothing answers on it",
+                                BIND_LINGER_BUDGET.as_secs()
+                            ),
+                        )));
+                    }
+                    tokio::time::sleep(BIND_RETRY_INTERVAL).await;
                 }
-            } else {
-                EndpointError::Io(err)
+                Err(err) => {
+                    trace::emit(
+                        &EndpointEvent::new(Stage::InstanceCreated, &trace_address, 0, false)
+                            .with_error(&err),
+                    );
+                    return Err(EndpointError::Io(err));
+                }
             }
-        })?;
+        };
+        trace::emit(&EndpointEvent::new(
+            Stage::InstanceCreated,
+            &trace_address,
+            0,
+            true,
+        ));
 
         Ok(Self {
             address: address.clone(),
             sddl,
             pending: Some(pending),
+            generation: 0,
+            trace_address,
         })
     }
 
@@ -255,28 +317,87 @@ impl Endpoint {
     ///
     /// Returns any error reported while waiting for or preparing an instance.
     pub async fn accept(&mut self) -> io::Result<Stream> {
+        let generation = self.generation;
+        let trace_address = Arc::clone(&self.trace_address);
         let pending = self.pending.as_ref().ok_or_else(|| {
-            io::Error::other("named pipe endpoint has no pending instance".to_string())
+            let err = io::Error::other("named pipe endpoint has no pending instance".to_string());
+            trace::emit(
+                &EndpointEvent::new(Stage::AcceptFailed, &self.trace_address, generation, false)
+                    .with_error(&err),
+            );
+            err
         })?;
 
-        // Cancelling here leaves `self.pending` untouched and still listening.
-        pending.connect().await?;
+        trace::emit(&EndpointEvent::new(
+            Stage::ConnectWaitStarted,
+            &trace_address,
+            generation,
+            true,
+        ));
 
-        // Create the replacement before consuming the connected instance. Taking
-        // first and replacing afterwards would leave the endpoint with no instance
-        // if creation failed, silently unlistening the daemon while it kept
-        // running. Ordering it this way makes that failure recoverable.
+        // Cancelling here leaves `self.pending` untouched and still listening.
+        pending.connect().await.inspect_err(|err| {
+            trace::emit(
+                &EndpointEvent::new(Stage::AcceptFailed, &trace_address, generation, true)
+                    .with_error(err),
+            );
+        })?;
+
+        trace::emit(&EndpointEvent::new(
+            Stage::ConnectCompleted,
+            &trace_address,
+            generation,
+            true,
+        ));
+
+        // Amplifies handoff races under test by giving the scheduler a chance to
+        // interleave here. Compiled out of release builds entirely.
+        yield_for_race_amplification().await;
+
+        trace::emit(&EndpointEvent::new(
+            Stage::ReplacementCreateStarted,
+            &trace_address,
+            generation,
+            true,
+        ));
+
+        // Create the replacement before consuming the connected instance. This is
+        // the ordering tokio documents for a named pipe server: handing the
+        // connected instance away first leaves an interval with no instance under
+        // the pipe name, during which a connecting client fails with NotFound. It
+        // also means a failed replacement cannot leave this endpoint holding
+        // nothing while the daemon keeps running.
         let next = create_instance(self.address.as_str(), &self.sddl, false).map_err(|err| {
+            trace::emit(
+                &EndpointEvent::new(Stage::AcceptFailed, &trace_address, generation, true)
+                    .with_error(&err),
+            );
             io::Error::new(
                 err.kind(),
                 format!("cannot create a replacement pipe instance: {err}"),
             )
         })?;
 
-        Ok(self
+        self.generation = self.generation.wrapping_add(1);
+        trace::emit(&EndpointEvent::new(
+            Stage::ReplacementCreated,
+            &trace_address,
+            self.generation,
+            true,
+        ));
+
+        let connected = self
             .pending
             .replace(next)
-            .expect("pending instance was present immediately above"))
+            .expect("pending instance was present immediately above");
+
+        trace::emit(&EndpointEvent::new(
+            Stage::ConnectionHandedOff,
+            &trace_address,
+            generation,
+            true,
+        ));
+        Ok(connected)
     }
 
     /// The address this endpoint is listening on.
@@ -289,19 +410,48 @@ impl Endpoint {
 /// Connected pipe on the client side.
 pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
+/// How long a client waits for a busy pipe before giving up.
+///
+/// A busy pipe means the daemon exists but every instance is currently serving
+/// someone, which resolves as soon as one is handed off. Waiting is correct; waiting
+/// forever is not, because an unbounded retry turns a stuck daemon into a client
+/// that never returns.
+const BUSY_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to pause between attempts on a busy pipe.
+const BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Connects to a running daemon.
+///
+/// Two conditions are distinguished deliberately, because they are not the same
+/// thing and collapsing them misleads the caller:
+///
+/// - the pipe does not exist, so no daemon is listening;
+/// - the pipe exists but every instance is busy, so a daemon *is* listening and
+///   the right response is to wait briefly for an instance to free up.
 ///
 /// # Errors
 ///
-/// Returns [`EndpointError::NotRunning`] when no daemon holds the pipe.
+/// Returns [`EndpointError::NotRunning`] when no daemon holds the pipe, and
+/// [`EndpointError::Io`] when the pipe stayed busy for longer than
+/// [`BUSY_WAIT_BUDGET`].
 pub async fn connect(address: &EndpointAddress) -> Result<ClientStream, EndpointError> {
+    let deadline = std::time::Instant::now() + BUSY_WAIT_BUDGET;
     loop {
         match ClientOptions::new().open(address.as_str()) {
             Ok(client) => return Ok(client),
             Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
-                // Every instance is currently serving a client. The daemon creates
-                // a replacement as soon as one is taken, so this resolves shortly.
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if std::time::Instant::now() >= deadline {
+                    return Err(EndpointError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "every instance of {address} stayed busy for {}s; \
+                             a daemon is listening but not accepting",
+                            BUSY_WAIT_BUDGET.as_secs()
+                        ),
+                    )));
+                }
+                tokio::time::sleep(BUSY_RETRY_INTERVAL).await;
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Err(EndpointError::NotRunning {
@@ -312,6 +462,25 @@ pub async fn connect(address: &EndpointAddress) -> Result<ClientStream, Endpoint
         }
     }
 }
+
+/// Test-only scheduling yield used to widen race windows around the handoff.
+///
+/// Races that only appear under real timing rarely reproduce in deterministic
+/// tests. Yielding here gives the runtime an opportunity to interleave other tasks
+/// at the exact point where the endpoint holds a connected instance and has not yet
+/// secured its replacement. This is not production behaviour and compiles to
+/// nothing outside tests.
+#[cfg(feature = "race-amplifier")]
+async fn yield_for_race_amplification() {
+    tokio::task::yield_now().await;
+}
+
+#[cfg(not(feature = "race-amplifier"))]
+#[expect(
+    clippy::unused_async,
+    reason = "mirrors the race-amplifier variant, which awaits"
+)]
+async fn yield_for_race_amplification() {}
 
 #[cfg(test)]
 mod tests {

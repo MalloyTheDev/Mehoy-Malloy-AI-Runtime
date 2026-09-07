@@ -29,6 +29,9 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "tim
 
 [dev-dependencies]
 mehoy-daemon.workspace = true
+# Integration tests run the transport with race amplification enabled. A plain
+# `cargo build` does not build dev-dependencies, so this stays out of binaries.
+mehoy-core = { workspace = true, features = ["race-amplifier"] }
 
 [lints]
 workspace = true
