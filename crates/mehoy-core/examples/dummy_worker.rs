@@ -27,6 +27,10 @@ use std::time::Duration;
 
 use mehoy_core::worker::process::{READY_MARKER, SHUTDOWN_COMMAND};
 
+/// Printed on the way out, saying why. Lets a test distinguish a delivered stop
+/// request from an exit caused by input simply being closed.
+const STOPPING_MARKER: &str = "MEHOY-WORKER-STOPPING";
+
 const USAGE: &str = "\
 mehoy-dummy-worker, a test stand-in for a supervised worker
 
@@ -174,12 +178,22 @@ fn main() -> ExitCode {
             let stdin = std::io::stdin();
             for line in stdin.lock().lines() {
                 match line {
-                    Ok(line) if line.trim() == SHUTDOWN_COMMAND => return ExitCode::SUCCESS,
+                    Ok(line) if line.trim() == SHUTDOWN_COMMAND => {
+                        // Announced so a test can tell a real stop request apart
+                        // from an exit caused merely by input being closed.
+                        let mut stdout = std::io::stdout();
+                        let _ = writeln!(stdout, "{STOPPING_MARKER} reason=command");
+                        let _ = stdout.flush();
+                        return ExitCode::SUCCESS;
+                    }
                     Ok(_) => {}
                     // Input closed, which is the weaker stop signal.
                     Err(_) => return ExitCode::SUCCESS,
                 }
             }
+            let mut stdout = std::io::stdout();
+            let _ = writeln!(stdout, "{STOPPING_MARKER} reason=input-closed");
+            let _ = stdout.flush();
             ExitCode::SUCCESS
         }
         Behaviour::NeverReady | Behaviour::ExitImmediately => unreachable!("handled above"),

@@ -36,6 +36,7 @@ fn spec(args: &[&str], deadlines: Deadlines) -> WorkerSpec {
         program: dummy_worker(),
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         deadlines,
+        capture_lines: mehoy_core::worker::log::DEFAULT_CAPTURE_LINES,
     }
 }
 
@@ -294,4 +295,74 @@ fn process_is_alive(pid: u32) -> bool {
     // Safety: `kill` with signal zero has no side effects on the target.
     let alive = unsafe { libc::kill(pid as libc::pid_t, 0) };
     alive == 0
+}
+
+#[tokio::test]
+async fn a_polite_stop_is_actually_delivered_not_merely_an_end_of_input() {
+    // Regression guard. Tokio's `Child::wait` closes the child's standard input
+    // before waiting. A readiness loop that awaited `wait` therefore sent the
+    // worker an end of input while merely watching it, so a worker that stops on
+    // closed input would exit on its own and the shutdown protocol would appear to
+    // work without ever being exercised.
+    //
+    // The worker reports why it stopped, so this distinguishes the two.
+    let supervisor = ProcessWorker;
+    let mut handle = supervisor
+        .spawn(spec(&["--ready"], quick()))
+        .await
+        .expect("worker starts");
+    supervisor
+        .wait_ready(&mut handle)
+        .await
+        .expect("worker becomes ready");
+
+    let exit = supervisor
+        .shutdown(&mut handle)
+        .await
+        .expect("worker stops politely");
+    assert_eq!(exit.cause, ExitCause::Requested);
+
+    let output = handle.log().render();
+    assert!(
+        output.contains("MEHOY-WORKER-STOPPING reason=command"),
+        "worker did not report receiving the stop command; it likely exited \
+         because its input was closed. Captured output:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn a_workers_output_is_captured_for_diagnostics() {
+    // Backend failure evidence appears in output before the process exits, so it
+    // must survive the exit rather than being discarded with the process.
+    let supervisor = ProcessWorker;
+    let mut handle = supervisor
+        .spawn(spec(&["--exit-immediately"], quick()))
+        .await
+        .expect("worker starts");
+    let _ = supervisor.wait_ready(&mut handle).await;
+
+    // The worker printed nothing here, but the capture must still be usable rather
+    // than absent, and must not panic after the process is gone.
+    let _ = handle.log().render();
+    assert_eq!(handle.log().dropped(), 0);
+}
+
+#[tokio::test]
+async fn readiness_output_is_retained_after_the_worker_stops() {
+    let supervisor = ProcessWorker;
+    let mut handle = supervisor
+        .spawn(spec(&["--ready"], quick()))
+        .await
+        .expect("worker starts");
+    supervisor
+        .wait_ready(&mut handle)
+        .await
+        .expect("worker becomes ready");
+    let _ = supervisor.shutdown(&mut handle).await;
+
+    let output = handle.log().render();
+    assert!(
+        output.contains("MEHOY-WORKER-READY"),
+        "the readiness announcement should still be in the capture:\n{output}"
+    );
 }

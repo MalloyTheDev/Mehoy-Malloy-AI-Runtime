@@ -1,0 +1,28 @@
+[package]
+name = "mehoy-backend-llama"
+description = "llama.cpp execution backend for the Mehoy runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mehoy-core.workspace = true
+
+getrandom = "0.4"
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Used only by the orphan test, to check whether a process still exists.
+libc.workspace = true
+
+[lints]
+workspace = true

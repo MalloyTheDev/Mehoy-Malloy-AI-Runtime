@@ -12,10 +12,12 @@
 //! The supervision contract ADR-0002 left open is specified here as deadlines and
 //! an explicit state machine rather than as prose.
 
+pub mod log;
 pub mod process;
 pub mod state;
 
-pub use process::{ProcessWorker, WorkerHandle};
+pub use log::{LogHandle, LogLine, LogStream, WorkerLog};
+pub use process::{ProbeOutcome, ProcessWorker, WorkerHandle};
 pub use state::{WorkerState, WorkerStateError};
 
 use std::fmt;
@@ -38,6 +40,8 @@ pub struct WorkerSpec {
     pub args: Vec<String>,
     /// Deadlines governing the worker's lifetime.
     pub deadlines: Deadlines,
+    /// How many output lines to retain for diagnostics.
+    pub capture_lines: usize,
 }
 
 /// The three deadlines a supervised worker is held to.

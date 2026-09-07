@@ -15,7 +15,7 @@ authors.workspace = true
 race-amplifier = []
 
 [dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

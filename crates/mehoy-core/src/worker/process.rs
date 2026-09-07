@@ -37,9 +37,11 @@
 use std::process::Stdio;
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::broadcast;
 
+use super::log::{LogHandle, LogStream};
 use super::{Deadlines, WorkerError, WorkerExit, WorkerReady, WorkerSpec, WorkerState};
 use crate::event::ExitCause;
 use crate::id::WorkerId;
@@ -49,6 +51,52 @@ pub const READY_MARKER: &str = "MEHOY-WORKER-READY";
 
 /// The line written to a worker's standard input to request a polite stop.
 pub const SHUTDOWN_COMMAND: &str = "shutdown";
+
+/// How often a readiness probe is consulted.
+const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How many captured lines the live feed buffers for a watching probe.
+const LINE_FEED_CAPACITY: usize = 256;
+
+/// How long to wait for a worker's stream readers to finish after it exits.
+const OUTPUT_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a readiness probe observed.
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    /// Not ready yet. Keep waiting until the startup deadline.
+    NotYet,
+    /// Ready, with whatever the backend reported.
+    Ready(WorkerReady),
+}
+
+/// Continuously reads one of a worker's streams into its log and live feed.
+///
+/// A stream that is never read fills its pipe and blocks the worker, which is
+/// indistinguishable from a hang, so this runs for the worker's whole life rather
+/// than only during startup.
+fn drain<R>(
+    reader: R,
+    stream: LogStream,
+    log: LogHandle,
+    feed: broadcast::Sender<super::log::LogLine>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(text)) = lines.next_line().await {
+            log.record(stream, text.clone());
+            // No subscribers is the normal case and not an error.
+            let _ = feed.send(super::log::LogLine {
+                stream,
+                at: Instant::now(),
+                text,
+            });
+        }
+    })
+}
 
 #[cfg(windows)]
 mod job {
@@ -137,7 +185,13 @@ pub struct WorkerHandle {
     id: WorkerId,
     state: WorkerState,
     child: Option<Child>,
-    stdout: Option<Lines<BufReader<ChildStdout>>>,
+    /// Bounded capture of everything the worker has printed.
+    log: LogHandle,
+    /// Live feed of captured lines, for a readiness probe that watches output.
+    lines: broadcast::Sender<super::log::LogLine>,
+    /// The tasks reading the worker's streams. Awaited after the process exits so
+    /// its final output is captured rather than lost to a race with the exit.
+    drains: Vec<tokio::task::JoinHandle<()>>,
     deadlines: Deadlines,
     /// Held for the worker's lifetime so that losing the daemon reaps the worker.
     #[cfg(windows)]
@@ -161,6 +215,60 @@ impl WorkerHandle {
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(Child::id)
+    }
+
+    /// The worker's captured output.
+    ///
+    /// Retained after the process exits, so a failure report can include the
+    /// evidence the worker printed on its way out.
+    #[must_use]
+    pub fn log(&self) -> &LogHandle {
+        &self.log
+    }
+
+    /// The deadlines this worker is held to.
+    #[must_use]
+    pub fn deadlines(&self) -> Deadlines {
+        self.deadlines
+    }
+
+    /// Marks the worker failed after an external readiness decision.
+    ///
+    /// Used by a backend that runs its own readiness protocol and needs the shared
+    /// state machine to agree with what it observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker cannot move to `Failed` from its state.
+    pub fn mark_failed(&mut self) -> Result<(), WorkerError> {
+        self.state = self.state.transition_to(WorkerState::Failed)?;
+        Ok(())
+    }
+
+    /// Waits for the stream readers to finish after the process has exited.
+    ///
+    /// The worker's pipes close when it exits, so the readers end on their own
+    /// shortly afterwards. Without waiting for them, a caller can read the capture
+    /// before the final lines have been recorded, which loses exactly the output a
+    /// failing worker prints on its way out.
+    ///
+    /// Bounded, because a reader blocked on a pipe inherited by some other process
+    /// must not hold up the caller.
+    pub async fn flush_output(&mut self) {
+        let drains = std::mem::take(&mut self.drains);
+        for drain in drains {
+            let _ = tokio::time::timeout(OUTPUT_FLUSH_BUDGET, drain).await;
+        }
+    }
+
+    /// Marks the worker ready after an external readiness decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker cannot move to `Ready` from its state.
+    pub fn mark_ready(&mut self) -> Result<(), WorkerError> {
+        self.state = self.state.transition_to(WorkerState::Ready)?;
+        Ok(())
     }
 }
 
@@ -188,7 +296,7 @@ impl ProcessWorker {
             .args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         #[cfg(unix)]
@@ -215,17 +323,27 @@ impl ProcessWorker {
             })?;
         }
 
-        let stdout = child
-            .stdout
-            .take()
-            .map(|out| BufReader::new(out).lines())
-            .ok_or_else(|| WorkerError::Io(std::io::Error::other("worker stdout unavailable")))?;
+        // Both streams are drained continuously. A worker whose output is never
+        // read will eventually block writing to a full pipe, which looks exactly
+        // like a hang and would be misdiagnosed as one.
+        let log = LogHandle::new(spec.capture_lines);
+        let (lines, _) = broadcast::channel(LINE_FEED_CAPACITY);
+
+        let mut drains = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            drains.push(drain(out, LogStream::Stdout, log.clone(), lines.clone()));
+        }
+        if let Some(err) = child.stderr.take() {
+            drains.push(drain(err, LogStream::Stderr, log.clone(), lines.clone()));
+        }
 
         Ok(WorkerHandle {
             id: spec.id,
             state,
             child: Some(child),
-            stdout: Some(stdout),
+            log,
+            lines,
+            drains,
             deadlines: spec.deadlines,
             #[cfg(windows)]
             _job: job,
@@ -243,12 +361,62 @@ impl ProcessWorker {
     /// Returns [`WorkerError::StartupTimeout`] when the deadline passes and
     /// [`WorkerError::ExitedDuringStartup`] when the process ends first.
     pub async fn wait_ready(&self, handle: &mut WorkerHandle) -> Result<WorkerReady, WorkerError> {
+        // The probe is called repeatedly and each call returns an owned future, so
+        // the receiver is shared rather than borrowed across calls.
+        let feed = std::sync::Arc::new(tokio::sync::Mutex::new(handle.lines.subscribe()));
+        self.wait_ready_with(handle, move || {
+            let feed = std::sync::Arc::clone(&feed);
+            async move {
+                let mut feed = feed.lock().await;
+                loop {
+                    match feed.try_recv() {
+                        Ok(line) if line.text.trim_start().starts_with(READY_MARKER) => {
+                            return Ok(ProbeOutcome::Ready(WorkerReady {
+                                announcement: line.text,
+                            }));
+                        }
+                        // Some other output line: keep looking at what is buffered.
+                        Ok(_) => {}
+                        // Falling behind loses diagnostics only. The readiness line
+                        // may still arrive, so this keeps waiting rather than
+                        // failing the startup.
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                        Err(
+                            broadcast::error::TryRecvError::Empty
+                            | broadcast::error::TryRecvError::Closed,
+                        ) => return Ok(ProbeOutcome::NotYet),
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Waits for readiness as decided by a caller-supplied probe.
+    ///
+    /// The generic supervisor deliberately does not know how any particular backend
+    /// reports readiness. It owns the parts that are the same for every backend:
+    /// the startup deadline, noticing that the process died, and keeping the state
+    /// machine honest. The probe owns what readiness actually means.
+    ///
+    /// The probe is polled on an interval. Returning `NotYet` means keep waiting;
+    /// an error from the probe is a terminal startup failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::StartupTimeout`] when the deadline passes and
+    /// [`WorkerError::ExitedDuringStartup`] when the process ends first.
+    pub async fn wait_ready_with<F, Fut>(
+        &self,
+        handle: &mut WorkerHandle,
+        mut probe: F,
+    ) -> Result<WorkerReady, WorkerError>
+    where
+        F: FnMut() -> Fut + Send,
+        Fut: Future<Output = Result<ProbeOutcome, WorkerError>> + Send,
+    {
         let started = Instant::now();
         let budget = handle.deadlines.startup;
-        let mut lines = handle
-            .stdout
-            .take()
-            .ok_or_else(|| WorkerError::Io(std::io::Error::other("worker stdout already taken")))?;
         let child = handle
             .child
             .as_mut()
@@ -256,31 +424,27 @@ impl ProcessWorker {
 
         let outcome = tokio::time::timeout(budget, async {
             loop {
-                tokio::select! {
-                    line = lines.next_line() => match line {
-                        Ok(Some(line)) if line.trim_start().starts_with(READY_MARKER) => {
-                            return Ok(WorkerReady { announcement: line });
-                        }
-                        // Any other output is the worker's own business.
-                        Ok(Some(_)) => continue,
-                        // Standard output closed without a readiness line. Wait for
-                        // the exit status rather than guessing at a cause.
-                        Ok(None) => {
-                            let status = child.wait().await.map_err(WorkerError::Io)?;
-                            return Err(WorkerError::ExitedDuringStartup { code: status.code() });
-                        }
-                        Err(err) => return Err(WorkerError::Io(err)),
-                    },
-                    status = child.wait() => {
-                        let status = status.map_err(WorkerError::Io)?;
-                        return Err(WorkerError::ExitedDuringStartup { code: status.code() });
-                    }
+                // A dead process can never become ready, so this is checked before
+                // waiting out the rest of the deadline for something impossible.
+                if let Some(status) = child.try_wait().map_err(WorkerError::Io)? {
+                    return Err(WorkerError::ExitedDuringStartup {
+                        code: status.code(),
+                    });
                 }
+                match probe().await? {
+                    ProbeOutcome::Ready(ready) => return Ok(ready),
+                    ProbeOutcome::NotYet => {}
+                }
+                // Deliberately `try_wait` and a sleep rather than awaiting `wait`.
+                // Tokio's `Child::wait` closes the child's standard input before
+                // waiting, so polling it here would send the worker an end of input
+                // during startup. A worker that stops on end of input would then
+                // exit while merely being watched, and the polite shutdown protocol
+                // would never actually be exercised.
+                tokio::time::sleep(PROBE_INTERVAL).await;
             }
         })
         .await;
-
-        handle.stdout = Some(lines);
 
         match outcome {
             Ok(Ok(ready)) => {
@@ -336,6 +500,7 @@ impl ProcessWorker {
         match tokio::time::timeout(budget, child.wait()).await {
             Ok(Ok(_status)) => {
                 handle.child = None;
+                handle.flush_output().await;
                 handle.state = if handle.state == WorkerState::Stopping {
                     handle.state.transition_to(WorkerState::Absent)?
                 } else {
@@ -366,6 +531,7 @@ impl ProcessWorker {
         };
         let status = child.wait().await.map_err(WorkerError::Io)?;
         handle.child = None;
+        handle.flush_output().await;
         // An exit that was not requested is a failure, and is reported with its
         // status rather than being flattened into a boolean.
         if handle.state.can_transition_to(WorkerState::Failed) {
@@ -385,6 +551,7 @@ impl ProcessWorker {
             let _ = child.wait().await;
             handle.child = None;
         }
+        handle.flush_output().await;
         Ok(())
     }
 }

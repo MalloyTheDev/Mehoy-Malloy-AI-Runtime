@@ -20,14 +20,17 @@ get right before anything else is built on top of it.
   deadlines, an explicit state machine, and reporting rather than restarting a
   crashed worker
 - Orphan cleanup, so no worker survives the abrupt death of the process that owns
-  it. Verified on Windows via a Job Object; the Linux mechanism is implemented but
-  unverified
+  it. Verified on Windows via a Job Object, against both a stand-in worker and a
+  real `llama-server`; the Linux mechanism is implemented but unverified
+- A llama.cpp backend that locates and identifies an executable, starts it under
+  supervision on a private loopback channel behind a per-worker secret, maps its
+  health endpoint to a readiness state, and captures its output for diagnostics
 
 **Not implemented**
 
 - Model import, registry, or loading
 - Inference of any kind, and therefore no token streaming or cancellation
-- Any real execution engine. Supervision is proven against a stand-in worker only
+- Backend installation or download. The executable is configured explicitly
 - Memory-aware scheduling
 - Any vendor-compatible endpoint
 
@@ -38,8 +41,11 @@ get right before anything else is built on top of it.
   orphan mechanism. See the open issues.
 - The protocol is not a compatibility commitment. It is expected to change.
 - The worker readiness and shutdown line protocol is provisional. It exists so
-  supervision can be proven against a controllable worker, and a real engine will
-  need its own probe.
+  supervision can be proven against a controllable worker; the llama.cpp backend
+  uses its health endpoint instead.
+- Backend readiness means the process answers and reports a serving state. It is
+  **not** evidence that generation works. No model has been loaded and no
+  generation has been performed, so nothing has established that yet.
 
 Architecture decisions are recorded in [docs/adr](docs/adr/README.md). The research
 behind them is in
@@ -85,6 +91,13 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets && cargo test 
 `cargo test --workspace` builds the example binaries the supervision tests execute,
 so it is sufficient on its own. Running a single test target with `--test` does not
 build them.
+
+Tests that need a real llama.cpp backend are skipped unless one is configured, and
+say so when they skip:
+
+```bash
+MEHOY_LLAMA_SERVER=/path/to/llama-server cargo test --workspace
+```
 
 To trace endpoint lifecycle transitions, including raw operating system errors:
 
