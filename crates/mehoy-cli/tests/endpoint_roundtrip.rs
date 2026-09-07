@@ -41,6 +41,25 @@ fn unique_address(label: &str) -> EndpointAddress {
     }
 }
 
+/// Creates a test endpoint directory with the same privacy the runtime requires.
+///
+/// A plain `create_dir_all` uses the process umask, which typically yields a
+/// directory readable by everyone. The transport refuses such a directory, and
+/// correctly so, which means a test fixture that creates one is testing its own
+/// mistake rather than the behaviour under test.
+#[cfg(unix)]
+fn create_private_dir(path: &std::path::Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    if path.exists() {
+        return;
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .expect("test directory is creatable");
+}
+
 /// Runs a daemon on `address` for the duration of `body`, then shuts it down and
 /// waits for it to finish.
 async fn with_daemon<F, Fut, T>(address: &EndpointAddress, body: F) -> T
@@ -188,8 +207,7 @@ async fn a_stale_socket_is_reclaimed_rather_than_blocking_startup() {
 
     let address = unique_address("stale");
     let path = std::path::PathBuf::from(address.as_str());
-    std::fs::create_dir_all(path.parent().expect("address has a parent"))
-        .expect("test directory is creatable");
+    create_private_dir(path.parent().expect("address has a parent"));
 
     // Bind and drop a plain listener without removing the file, which is exactly
     // what an unclean daemon exit leaves behind.
@@ -220,8 +238,7 @@ async fn a_regular_file_at_the_endpoint_path_is_never_deleted() {
     // non-socket occupant must be reported, not removed.
     let address = unique_address("occupied");
     let path = std::path::PathBuf::from(address.as_str());
-    std::fs::create_dir_all(path.parent().expect("address has a parent"))
-        .expect("test directory is creatable");
+    create_private_dir(path.parent().expect("address has a parent"));
     std::fs::write(&path, b"not a socket").expect("occupant file is written");
 
     match Endpoint::bind(&address).await {
@@ -280,4 +297,60 @@ async fn serves_concurrent_clients() {
         }
     })
     .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_world_accessible_endpoint_directory_is_refused() {
+    // ADR-0004 requires the endpoint to be private to its user. A directory other
+    // accounts can enter would let them reach or replace the socket, so it is
+    // refused rather than used.
+    //
+    // This is not hypothetical: an ordinary `create_dir_all` produces mode 0755
+    // under a typical umask, which is exactly this case.
+    use std::os::unix::fs::PermissionsExt;
+
+    let address = unique_address("insecure-dir");
+    let path = std::path::PathBuf::from(address.as_str());
+    let dir = path.parent().expect("address has a parent").to_path_buf();
+    let open_dir = dir.join("world-readable");
+    std::fs::create_dir_all(&open_dir).expect("test directory is creatable");
+    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("permissions are settable");
+
+    let inside = EndpointAddress::new(open_dir.join("mehoyd.sock").to_string_lossy().into_owned());
+    match Endpoint::bind(&inside).await {
+        Err(EndpointError::InsecureDirectory { reason, .. }) => {
+            assert!(reason.contains("beyond the owner"), "{reason}");
+        }
+        Err(other) => panic!("expected InsecureDirectory, got {other}"),
+        Ok(_) => panic!("a world-accessible endpoint directory must be refused"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_directory_created_by_the_runtime_is_private() {
+    // The directory must be private at creation, not fixed afterwards. A mode
+    // applied after the fact is a window, however brief.
+    use std::os::unix::fs::PermissionsExt;
+
+    let address = unique_address("created-dir");
+    let path = std::path::PathBuf::from(address.as_str());
+    let dir = path.parent().expect("address has a parent").to_path_buf();
+    let fresh = dir.join("runtime-created");
+    let inside = EndpointAddress::new(fresh.join("mehoyd.sock").to_string_lossy().into_owned());
+
+    let endpoint = Endpoint::bind(&inside).await.expect("binds");
+    let mode = std::fs::metadata(&fresh)
+        .expect("directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(endpoint);
+
+    assert_eq!(
+        mode, 0o700,
+        "the endpoint directory should be owner-only, got {mode:04o}"
+    );
 }

@@ -12,21 +12,29 @@ use mehoy_core::event::ExitCause;
 use mehoy_core::id::IdAllocator;
 use mehoy_core::worker::{Deadlines, ProcessWorker, WorkerError, WorkerSpec, WorkerState};
 
-/// Locates the dummy worker binary next to the test executable.
-fn dummy_worker() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test executable has a path");
-    path.pop(); // the test binary's own file name
-    if path.ends_with("deps") {
-        path.pop();
+/// Locates an example binary built alongside this test.
+///
+/// The test binary's own location varies between cargo versions and layouts, so
+/// rather than assuming a fixed relative path this walks up from the executable
+/// looking for the `examples` directory. Assuming `deps/..` works on one layout and
+/// silently fails on another.
+fn example_binary(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    for ancestor in exe.ancestors().take(6) {
+        let candidate = ancestor.join("examples").join(&file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
     }
-    path.push("examples");
-    path.push(format!("dummy_worker{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.exists(),
-        "dummy worker not found at {}; cargo builds examples during `cargo test`,          so this missing means the example target was not built",
-        path.display()
-    );
-    path
+    None
+}
+
+/// The dummy worker binary.
+fn dummy_worker() -> PathBuf {
+    example_binary("dummy_worker").unwrap_or_else(|| {
+        panic!("the dummy_worker example was not built; it is required by these tests")
+    })
 }
 
 fn spec(args: &[&str], deadlines: Deadlines) -> WorkerSpec {

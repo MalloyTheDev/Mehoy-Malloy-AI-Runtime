@@ -143,15 +143,21 @@ async fn readiness_is_backend_ready_and_not_inference_verified() {
 }
 
 /// Locates an example binary built alongside this test.
-fn example(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("test executable has a path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
+///
+/// The test binary's own location varies between cargo versions and layouts, so
+/// rather than assuming a fixed relative path this walks up from the executable
+/// looking for the `examples` directory. Assuming `deps/..` works on one layout and
+/// silently fails on another.
+fn example_binary(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    for ancestor in exe.ancestors().take(6) {
+        let candidate = ancestor.join("examples").join(&file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
     }
-    path.push("examples");
-    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    path
+    None
 }
 
 #[cfg(windows)]
@@ -189,11 +195,10 @@ fn a_real_backend_does_not_survive_the_abrupt_death_of_its_owner() {
     if backend().is_none() {
         return;
     }
-    let parent = example("llama_orphan_parent");
-    if !parent.exists() {
-        eprintln!("SKIPPED: {} not built", parent.display());
+    let Some(parent) = example_binary("llama_orphan_parent") else {
+        eprintln!("SKIPPED: the llama_orphan_parent example was not built");
         return;
-    }
+    };
 
     let mut owner = std::process::Command::new(&parent)
         .stdout(std::process::Stdio::piped())

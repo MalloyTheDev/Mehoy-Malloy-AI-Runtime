@@ -14,7 +14,6 @@ authors = ["MalloyTheDev"]
 mehoy-core = { path = "crates/mehoy-core", version = "0.1.0" }
 mehoy-protocol = { path = "crates/mehoy-protocol", version = "0.1.0" }
 mehoy-daemon = { path = "crates/mehoy-daemon", version = "0.1.0" }
-mehoy-registry = { path = "crates/mehoy-registry", version = "0.1.0" }
 
 http-body-util = "0.1.5"
 hyper = "1.11"

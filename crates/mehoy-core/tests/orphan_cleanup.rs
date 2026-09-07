@@ -17,20 +17,29 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Locates an example binary built alongside this test.
-fn example(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("test executable has a path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
+///
+/// The test binary's own location varies between cargo versions and layouts, so
+/// rather than assuming a fixed relative path this walks up from the executable
+/// looking for the `examples` directory. Assuming `deps/..` works on one layout and
+/// silently fails on another.
+fn example_binary(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    for ancestor in exe.ancestors().take(6) {
+        let candidate = ancestor.join("examples").join(&file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
     }
-    path.push("examples");
-    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.exists(),
-        "example {name} not built at {}",
-        path.display()
-    );
-    path
+    None
+}
+
+fn example(name: &str) -> PathBuf {
+    example_binary(name).unwrap_or_else(|| {
+        panic!(
+            "example {name} was not built; cargo builds examples during `cargo test`,              so this means the example target is missing"
+        )
+    })
 }
 
 #[cfg(windows)]
