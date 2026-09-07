@@ -16,20 +16,30 @@ get right before anything else is built on top of it.
 - `mehoy`, a command-line client
 - Unix domain socket transport on Unix, named pipe transport on Windows
 - `GET /health` and `GET /v1/runtime`
+- Supervision of worker processes: readiness probing, startup and shutdown
+  deadlines, an explicit state machine, and reporting rather than restarting a
+  crashed worker
+- Orphan cleanup, so no worker survives the abrupt death of the process that owns
+  it. Verified on Windows via a Job Object; the Linux mechanism is implemented but
+  unverified
 
 **Not implemented**
 
 - Model import, registry, or loading
 - Inference of any kind, and therefore no token streaming or cancellation
-- Backend worker processes and their supervision
+- Any real execution engine. Supervision is proven against a stand-in worker only
 - Memory-aware scheduling
 - Any vendor-compatible endpoint
 
 **Known limitations**
 
-- The Unix transport compiles and is type-checked, but has not been executed. Only the
-  Windows path has been run. See the open issues.
+- Unix code compiles and is type-checked, but has never been executed. Only the
+  Windows paths have been run. This covers the socket transport and the parent-death
+  orphan mechanism. See the open issues.
 - The protocol is not a compatibility commitment. It is expected to change.
+- The worker readiness and shutdown line protocol is provisional. It exists so
+  supervision can be proven against a controllable worker, and a real engine will
+  need its own probe.
 
 Architecture decisions are recorded in [docs/adr](docs/adr/README.md). The research
 behind them is in
@@ -70,6 +80,16 @@ invalid, and `3` when no daemon is listening.
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets && cargo test --workspace
+```
+
+`cargo test --workspace` builds the example binaries the supervision tests execute,
+so it is sufficient on its own. Running a single test target with `--test` does not
+build them.
+
+To trace endpoint lifecycle transitions, including raw operating system errors:
+
+```bash
+MEHOY_TRACE_ENDPOINT=1 cargo run --bin mehoyd
 ```
 
 ## License

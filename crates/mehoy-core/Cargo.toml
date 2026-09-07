@@ -15,7 +15,7 @@ authors.workspace = true
 race-amplifier = []
 
 [dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -25,11 +25,18 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "dummy_worker"
+
+[[example]]
+name = "orphan_parent"
 
 [lints]
 workspace = true
