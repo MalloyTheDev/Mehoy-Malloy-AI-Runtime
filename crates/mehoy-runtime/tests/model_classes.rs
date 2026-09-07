@@ -541,3 +541,292 @@ async fn a_reloaded_instance_has_not_generated_anything() {
     );
     second.unload().await.expect("unloads");
 }
+
+// ----------------------------------------------------------- streaming generation
+
+/// Drains a stream, asserting the sequence rather than merely the contents.
+///
+/// The shape is the contract: exactly one `Started` first, then deltas, then
+/// exactly one `Completed`. Checking only that each kind appeared would pass on a
+/// stream that emitted them in any order.
+async fn drain_asserting_shape(
+    stream: &mut mehoy_core::inference::GenerationStream,
+) -> (String, mehoy_core::inference::GenerationSummary) {
+    use mehoy_core::inference::GenerationEvent;
+
+    let request_id = stream.request_id();
+    let mut text = String::new();
+    let mut summary = None;
+    let mut position = 0usize;
+
+    while let Some(item) = stream.next().await {
+        let event = item.expect("the stream must not fail");
+        assert_eq!(
+            event.request_id(),
+            request_id,
+            "event {position} belongs to another request"
+        );
+        match event {
+            GenerationEvent::Started { .. } => {
+                assert_eq!(position, 0, "Started appeared at position {position}");
+            }
+            GenerationEvent::TextDelta { text: delta, .. } => {
+                assert_ne!(position, 0, "a delta preceded Started");
+                assert!(summary.is_none(), "a delta followed the completion");
+                assert!(!delta.is_empty(), "an empty delta reached the consumer");
+                text.push_str(&delta);
+            }
+            GenerationEvent::Completed {
+                summary: reported, ..
+            } => {
+                assert!(summary.is_none(), "Completed appeared twice");
+                summary = Some(reported);
+            }
+        }
+        position += 1;
+    }
+
+    (text, summary.expect("the stream must complete"))
+}
+
+#[tokio::test]
+async fn a_generative_model_actually_streams() {
+    use mehoy_core::inference::FinishReason;
+
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let loaded = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+
+    let mut stream = loaded
+        .generate_text_stream(&generation_request())
+        .await
+        .expect("the stream opens");
+
+    let (text, summary) = drain_asserting_shape(&mut stream).await;
+
+    assert!(!text.is_empty(), "the stream produced no content");
+    assert!(
+        matches!(
+            summary.finish_reason,
+            FinishReason::Stop | FinishReason::Length
+        ),
+        "unrecognised finish reason {}",
+        summary.finish_reason
+    );
+    if let Some(usage) = summary.usage {
+        assert!(
+            usage.output_tokens > 0,
+            "content streamed but no output tokens"
+        );
+        assert!(
+            usage.output_tokens <= 8,
+            "produced {} tokens against a budget of 8",
+            usage.output_tokens
+        );
+    }
+    assert!(stream.next().await.is_none(), "an event followed Completed");
+
+    eprintln!(
+        "streamed {text:?} (finish: {}, usage: {:?})",
+        summary.finish_reason, summary.usage
+    );
+
+    loaded.unload().await.expect("unloads");
+}
+
+#[tokio::test]
+async fn a_stream_is_evidence_only_once_it_completes() {
+    use mehoy_core::inference::GenerationEvent;
+
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let mut loaded = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+
+    assert!(
+        !loaded
+            .instance()
+            .capabilities()
+            .is_verified(ModelCapability::TextGeneration),
+        "loading must not verify generation"
+    );
+
+    let mut stream = loaded
+        .generate_text_stream(&generation_request())
+        .await
+        .expect("the stream opens");
+
+    // An open stream proves the backend accepted a request, nothing more.
+    assert!(!stream.demonstrated_generation());
+
+    let mut deltas = 0usize;
+    while let Some(item) = stream.next().await {
+        let event = item.expect("the stream must not fail");
+        if let GenerationEvent::TextDelta { .. } = event {
+            deltas += 1;
+            // The backend could still die before completing, so content on its own
+            // is not yet a demonstrated capability.
+            assert!(
+                !stream.demonstrated_generation(),
+                "a delta alone verified the capability"
+            );
+        }
+    }
+
+    assert!(deltas > 0, "the model streamed no content");
+    assert!(stream.demonstrated_generation());
+
+    assert!(
+        !loaded
+            .instance()
+            .capabilities()
+            .is_verified(ModelCapability::TextGeneration),
+        "streaming must not verify anything until the outcome is recorded"
+    );
+
+    assert!(loaded.record_generation_stream(&stream));
+    assert!(
+        loaded
+            .instance()
+            .capabilities()
+            .is_verified(ModelCapability::TextGeneration),
+        "a completed stream should have verified the capability"
+    );
+    eprintln!(
+        "text generation verified by streaming: {}",
+        loaded
+            .instance()
+            .capabilities()
+            .state(ModelCapability::TextGeneration)
+    );
+
+    // Nothing was verified by association.
+    for other in [
+        ModelCapability::Embeddings,
+        ModelCapability::Vision,
+        ModelCapability::ToolCalling,
+        ModelCapability::StructuredOutput,
+    ] {
+        assert!(
+            !loaded.instance().capabilities().is_verified(other),
+            "{other} was verified without being demonstrated"
+        );
+    }
+
+    loaded.unload().await.expect("unloads");
+}
+
+#[tokio::test]
+async fn both_delivery_modes_serve_the_same_request() {
+    use mehoy_core::inference::FinishReason;
+
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let loaded = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+
+    // The same request type, the same parameters, one instance. Streaming is a
+    // delivery choice rather than a different kind of work.
+    let whole = loaded
+        .generate_text(&generation_request())
+        .await
+        .expect("the model generates");
+
+    let mut stream = loaded
+        .generate_text_stream(&generation_request())
+        .await
+        .expect("the stream opens");
+    let streamed = stream.collect().await.expect("the stream completes");
+
+    for (label, result) in [("whole", &whole), ("streamed", &streamed)] {
+        assert!(!result.text.is_empty(), "{label} produced no content");
+        assert!(
+            matches!(
+                result.finish_reason,
+                FinishReason::Stop | FinishReason::Length
+            ),
+            "{label} reported an unrecognised finish reason {}",
+            result.finish_reason
+        );
+    }
+
+    // Sampling is not asserted to be reproducible across requests, which is
+    // ADR-0008's position on seeds. What is asserted is that both paths carry real
+    // content and a normalised outcome.
+    eprintln!(
+        "whole {:?} (finish {}) / streamed {:?} (finish {})",
+        whole.text, whole.finish_reason, streamed.text, streamed.finish_reason
+    );
+
+    loaded.unload().await.expect("unloads");
+}
+
+#[tokio::test]
+async fn a_stream_is_refused_before_reaching_a_backend_when_a_parameter_is_unusable() {
+    use mehoy_core::inference::{GenerateTextRequest, GenerationParameters};
+
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let loaded = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+
+    // Streaming must not become a way around validation.
+    let request = GenerateTextRequest::continuation("x").with_parameters(GenerationParameters {
+        temperature: Some(-1.0),
+        ..GenerationParameters::default()
+    });
+
+    match loaded.generate_text_stream(&request).await {
+        Err(LoadError::InvalidRequest { detail }) => {
+            assert!(
+                detail.contains("temperature"),
+                "unexpected detail: {detail}"
+            );
+        }
+        Err(other) => panic!("expected a refused request, got {other}"),
+        Ok(_) => panic!("an unusable temperature opened a stream"),
+    }
+
+    loaded.unload().await.expect("unloads");
+}

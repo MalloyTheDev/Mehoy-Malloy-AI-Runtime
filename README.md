@@ -44,10 +44,14 @@ get right before anything else is built on top of it.
   the artifact's metadata
 - Text generation from a raw continuation, with a deliberately small portable
   parameter set, verified the same way embeddings are: by performing one
+- Incremental delivery of a generation as runtime-native events, with the engine's
+  event framing and wire format confined to the backend adapter, and bounded
+  buffering so a slow consumer slows the backend rather than this process
 
 **Not implemented**
 
-- Streaming and cancellation. A generation returns one complete result
+- Cancellation. A stream runs to its own end, and abandoning it stops the backend
+  at the next event rather than on request
 - Conversation input. Continuation is the primitive; a conversation shape arrives
   when something can render a template for it
 - Any model class beyond text embeddings and text generation. Nothing prevents them;

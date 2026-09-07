@@ -23,9 +23,9 @@ use std::fmt;
 use mehoy_backend_llama::{
     BackendError, LlamaCppBackend, LlamaCppWorkerSpec, ModelDescriptor, RunningBackend,
 };
-use mehoy_core::id::WorkerId;
+use mehoy_core::id::{IdAllocator, WorkerId};
 use mehoy_core::inference::{
-    self, EmbedRequest, EmbeddingResult, GenerateTextRequest, GenerationResult,
+    self, EmbedRequest, EmbeddingResult, GenerateTextRequest, GenerationResult, GenerationStream,
 };
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::{ArtifactId, ArtifactRegistry, ArtifactState, ModelArtifact, RegistryError};
@@ -133,6 +133,11 @@ impl From<RegistryError> for LoadError {
 pub struct LoadedModel {
     instance: ModelInstance,
     backend: RunningBackend,
+    /// Identifies each inference request this instance serves.
+    ///
+    /// Owned here because nothing above the loader allocates one yet. When a
+    /// request pipeline exists, identity will arrive with the request instead.
+    requests: IdAllocator,
 }
 
 impl LoadedModel {
@@ -274,6 +279,77 @@ impl LoadedModel {
         Ok(result)
     }
 
+    /// Continues text, delivering it incrementally.
+    ///
+    /// Parameters are validated before anything is sent, exactly as they are for
+    /// the non-streaming path, so an unusable value is refused the same way
+    /// regardless of how the caller asked for output.
+    ///
+    /// Returning `Ok` means the backend accepted the request and the stream is
+    /// established. It does not mean generation succeeded: a backend that dies
+    /// after one delta returns a stream that fails, which is the distinction the
+    /// event sequence exists to express.
+    ///
+    /// This does not verify the capability. Verification requires observing the
+    /// whole stream, which only the consumer can do, so a caller that wants the
+    /// attempt to count as evidence passes the drained stream to
+    /// [`LoadedModel::record_generation_stream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::NotUsable`] when the instance is not ready,
+    /// [`LoadError::InvalidRequest`] when a parameter cannot be honoured, and
+    /// [`LoadError::Inference`] when the backend refuses to begin.
+    pub async fn generate_text_stream(
+        &self,
+        request: &GenerateTextRequest,
+    ) -> Result<GenerationStream, LoadError> {
+        if !self.instance.state().is_usable() {
+            return Err(LoadError::NotUsable {
+                state: self.instance.state().to_string(),
+            });
+        }
+
+        request
+            .parameters
+            .validate()
+            .map_err(|invalid| LoadError::InvalidRequest {
+                detail: invalid.to_string(),
+            })?;
+
+        mehoy_backend_llama::stream(self.backend.channel(), request, self.requests.request())
+            .await
+            .map_err(|source| LoadError::Inference {
+                detail: source.to_string(),
+            })
+    }
+
+    /// Records what a drained stream demonstrated, promoting the capability if it
+    /// earned it.
+    ///
+    /// Returns whether the capability is now verified by this stream.
+    ///
+    /// A stream earns it only by reaching a terminal completion after delivering at
+    /// least one non-empty delta. An opened stream proves the backend accepted a
+    /// request, and a first delta proves it began answering, but neither survives
+    /// the backend dying immediately afterwards. Evidence a later event could
+    /// contradict is not evidence.
+    ///
+    /// A stream that failed leaves the capability untouched rather than clearing
+    /// it. A refusal is not proof of absence, and this is a record of what has been
+    /// demonstrated, not a health check: whether the instance is currently well is
+    /// [`ModelInstance::state`].
+    pub fn record_generation_stream(&mut self, stream: &GenerationStream) -> bool {
+        if !stream.demonstrated_generation() {
+            return false;
+        }
+        let backend = self.backend.identity().cloned();
+        self.instance
+            .capabilities_mut()
+            .verify(ModelCapability::TextGeneration, backend);
+        true
+    }
+
     /// Stops the backend and destroys the instance.
     ///
     /// # Errors
@@ -411,7 +487,11 @@ impl ModelLoader {
             capabilities,
         );
 
-        Ok(LoadedModel { instance, backend })
+        Ok(LoadedModel {
+            instance,
+            backend,
+            requests: IdAllocator::default(),
+        })
     }
 }
 

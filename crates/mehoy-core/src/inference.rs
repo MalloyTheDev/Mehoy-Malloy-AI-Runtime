@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use crate::id::RequestId;
+
 /// An identifier for a task this build does not itself define.
 ///
 /// The escape hatch that keeps the runtime from being limited to the model classes
@@ -519,9 +521,412 @@ pub fn validate_generation(result: &GenerationResult) -> Result<(), GenerationDe
     Ok(())
 }
 
+/// What a completed generation reports beyond the text itself.
+///
+/// The text is deliberately absent. A streaming consumer has already received
+/// every delta, so repeating the whole payload in the terminal event would send
+/// the generated content twice. A consumer that wants the final string
+/// accumulates the deltas it was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationSummary {
+    pub finish_reason: FinishReason,
+    pub usage: Option<GenerationUsage>,
+}
+
+/// One observable step of a generation in progress.
+///
+/// `TextDelta` rather than a token, because a backend chunk is not guaranteed to
+/// correspond to one tokeniser token, and a future backend may stream partial
+/// text, several decoded tokens at once, reasoning text, tool-call fragments,
+/// structured-output fragments, or audio. Naming the unit a token would be
+/// inaccurate almost immediately, and the inaccuracy would be baked into a
+/// published type.
+///
+/// There is no failure variant. A stream yields `Result`, so a failure ends the
+/// stream rather than appearing as a step within it, and no variant exists here
+/// without semantics behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationEvent {
+    /// The runtime accepted the request and established the backend stream.
+    ///
+    /// Deliberately not "the model produced its first token". Separating
+    /// acceptance from first output is what makes the interval between this event
+    /// and the first [`GenerationEvent::TextDelta`] a measurable quantity later.
+    Started { request_id: RequestId },
+    /// Generated text, valid on its own.
+    ///
+    /// Never empty: a backend event carrying no text is not a step a consumer
+    /// needs to see. Always complete UTF-8, because transport framing is resolved
+    /// below this type rather than passed through it.
+    TextDelta { request_id: RequestId, text: String },
+    /// The generation ended normally. No further events follow.
+    Completed {
+        request_id: RequestId,
+        summary: GenerationSummary,
+    },
+}
+
+impl GenerationEvent {
+    /// The request this event belongs to.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        match *self {
+            Self::Started { request_id }
+            | Self::TextDelta { request_id, .. }
+            | Self::Completed { request_id, .. } => request_id,
+        }
+    }
+}
+
+/// Why a generation stream ended without completing.
+///
+/// A stream that stops early is never reported as a completion. Distinguishing
+/// these is the whole point: a fabricated terminal event would let a truncated
+/// answer be consumed as a finished one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationStreamError {
+    /// The backend refused the request before any content was produced.
+    Refused { detail: String },
+    /// A backend event could not be understood.
+    MalformedEvent { detail: String },
+    /// The backend stopped sending before reporting a terminal event.
+    UnexpectedEnd { detail: String },
+    /// The stream could not be carried.
+    Transport { detail: String },
+}
+
+impl fmt::Display for GenerationStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused { detail } => write!(f, "the backend refused the request: {detail}"),
+            Self::MalformedEvent { detail } => {
+                write!(f, "a backend stream event was not usable: {detail}")
+            }
+            Self::UnexpectedEnd { detail } => {
+                write!(f, "the backend stream ended before completing: {detail}")
+            }
+            Self::Transport { detail } => write!(f, "the generation stream failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for GenerationStreamError {}
+
+/// How many events may be buffered between a backend and a consumer.
+///
+/// Small on purpose. The buffer exists to absorb ordinary scheduling jitter, not
+/// to decouple a fast producer from a slow one: once it fills, the adapter stops
+/// reading the backend's socket, which is how a slow consumer ends up slowing the
+/// backend rather than growing this process's memory.
+pub const GENERATION_STREAM_BUFFER: usize = 32;
+
+type StreamItem = Result<GenerationEvent, GenerationStreamError>;
+
+/// Creates a generation stream and the handle a backend emits into.
+///
+/// [`GenerationEvent::Started`] is placed in the buffer here rather than sent by
+/// the caller, which is what makes it structurally impossible to emit it twice,
+/// to omit it, or to emit it after a delta. Call this once the backend stream is
+/// actually established, since that is what the event claims.
+#[must_use]
+pub fn generation_stream(request_id: RequestId) -> (GenerationSink, GenerationStream) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(GENERATION_STREAM_BUFFER);
+    sender
+        .try_send(Ok(GenerationEvent::Started { request_id }))
+        .expect("a freshly created buffer has room for the first event");
+    (
+        GenerationSink {
+            request_id,
+            sender,
+            finished: false,
+        },
+        GenerationStream {
+            receiver,
+            request_id,
+            deltas: 0,
+            completed: false,
+            finished: false,
+        },
+    )
+}
+
+/// The producing half of a generation stream.
+///
+/// Sending awaits room in the buffer, so a consumer that stops reading applies
+/// backpressure to whatever is driving this sink instead of accumulating.
+#[derive(Debug)]
+pub struct GenerationSink {
+    request_id: RequestId,
+    sender: tokio::sync::mpsc::Sender<StreamItem>,
+    finished: bool,
+}
+
+impl GenerationSink {
+    /// The request being generated.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Emits generated text.
+    ///
+    /// Empty text is dropped rather than forwarded. Backends routinely send events
+    /// carrying no content, most often the terminal one, and passing those through
+    /// would make every consumer filter them.
+    ///
+    /// Returns `false` when the consumer has gone away, which is the signal to stop
+    /// generating rather than an error to report.
+    pub async fn delta(&mut self, text: String) -> bool {
+        if self.finished {
+            return false;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        let event = GenerationEvent::TextDelta {
+            request_id: self.request_id,
+            text,
+        };
+        self.sender.send(Ok(event)).await.is_ok()
+    }
+
+    /// Ends the stream normally.
+    pub async fn complete(mut self, summary: GenerationSummary) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let event = GenerationEvent::Completed {
+            request_id: self.request_id,
+            summary,
+        };
+        let _ = self.sender.send(Ok(event)).await;
+    }
+
+    /// Ends the stream with a failure.
+    ///
+    /// Consuming the sink is what prevents a completion from following a failure.
+    pub async fn fail(mut self, error: GenerationStreamError) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let _ = self.sender.send(Err(error)).await;
+    }
+}
+
+/// The consuming half of a generation stream.
+///
+/// Yields [`GenerationEvent::Started`], then zero or more
+/// [`GenerationEvent::TextDelta`], then either [`GenerationEvent::Completed`] or
+/// one error, then nothing.
+#[derive(Debug)]
+pub struct GenerationStream {
+    receiver: tokio::sync::mpsc::Receiver<StreamItem>,
+    request_id: RequestId,
+    deltas: usize,
+    /// Whether a terminal completion was observed.
+    ///
+    /// Deliberately distinct from `finished`. A stream that delivers content and
+    /// then fails is finished but did not complete, and conflating the two would
+    /// let a failed generation stand as evidence that generation works.
+    completed: bool,
+    /// Whether any further events can arrive.
+    finished: bool,
+}
+
+impl GenerationStream {
+    /// The request being generated.
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Awaits the next event, or `None` once the stream has ended.
+    ///
+    /// A stream whose producer disappears without completing yields
+    /// [`GenerationStreamError::UnexpectedEnd`] rather than simply ending, so a
+    /// truncated generation cannot be mistaken for a finished one by a consumer
+    /// that only checks for the end of the stream.
+    pub async fn next(&mut self) -> Option<StreamItem> {
+        if self.finished {
+            return None;
+        }
+        match self.receiver.recv().await {
+            Some(Ok(event)) => {
+                match &event {
+                    GenerationEvent::TextDelta { .. } => self.deltas += 1,
+                    GenerationEvent::Completed { .. } => {
+                        self.completed = true;
+                        self.finished = true;
+                    }
+                    GenerationEvent::Started { .. } => {}
+                }
+                Some(Ok(event))
+            }
+            Some(Err(error)) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+            None => {
+                self.finished = true;
+                Some(Err(GenerationStreamError::UnexpectedEnd {
+                    detail: "the backend stream stopped without reporting an outcome".to_owned(),
+                }))
+            }
+        }
+    }
+
+    /// Whether this stream demonstrated text generation.
+    ///
+    /// True only after a terminal completion that followed at least one non-empty
+    /// delta. An opened stream, a first delta, or content without a completion are
+    /// each insufficient: the backend could still fail immediately afterwards, and
+    /// a capability claim that a later event would contradict is not evidence.
+    #[must_use]
+    pub const fn demonstrated_generation(&self) -> bool {
+        self.completed && self.deltas > 0
+    }
+
+    /// Collects the whole stream into one result.
+    ///
+    /// For callers that want streaming transport but not incremental delivery, and
+    /// for comparing a stream against the non-streaming path over the same request.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error the stream yields.
+    pub async fn collect(&mut self) -> Result<GenerationResult, GenerationStreamError> {
+        let mut text = String::new();
+        while let Some(item) = self.next().await {
+            match item? {
+                GenerationEvent::Started { .. } => {}
+                GenerationEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
+                GenerationEvent::Completed { summary, .. } => {
+                    return Ok(GenerationResult {
+                        text,
+                        finish_reason: summary.finish_reason,
+                        usage: summary.usage,
+                    });
+                }
+            }
+        }
+        Err(GenerationStreamError::UnexpectedEnd {
+            detail: "the stream ended without a completion".to_owned(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request() -> RequestId {
+        RequestId::from_raw(1)
+    }
+
+    fn summary() -> GenerationSummary {
+        GenerationSummary {
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_starts_before_a_producer_does_anything() {
+        // Started is buffered when the stream is created rather than sent by the
+        // producer, so it cannot be forgotten, duplicated, or sent late.
+        let (sink, mut stream) = generation_stream(request());
+        drop(sink);
+        assert_eq!(
+            stream.next().await,
+            Some(Ok(GenerationEvent::Started {
+                request_id: request()
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_producer_that_vanishes_is_reported_rather_than_silently_ending() {
+        // A dropped producer, including one whose task panicked, must not look like
+        // a stream that finished.
+        let (mut sink, mut stream) = generation_stream(request());
+        sink.delta("partial".to_owned()).await;
+        drop(sink);
+
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(GenerationStreamError::UnexpectedEnd { .. }))
+        ));
+        assert!(!stream.demonstrated_generation());
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_is_not_evidence_even_after_delivering_content() {
+        // Content followed by a failure is a truncated answer, not a demonstration.
+        let (mut sink, mut stream) = generation_stream(request());
+        sink.delta("some text".to_owned()).await;
+        sink.fail(GenerationStreamError::Transport {
+            detail: "reset".to_owned(),
+        })
+        .await;
+
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                break;
+            }
+        }
+        assert!(!stream.demonstrated_generation());
+    }
+
+    #[tokio::test]
+    async fn empty_deltas_are_dropped_by_the_producer() {
+        let (mut sink, mut stream) = generation_stream(request());
+        sink.delta(String::new()).await;
+        sink.delta("real".to_owned()).await;
+        sink.delta(String::new()).await;
+        sink.complete(summary()).await;
+
+        let mut kinds = Vec::new();
+        while let Some(Ok(event)) = stream.next().await {
+            kinds.push(event);
+        }
+        assert_eq!(kinds.len(), 3, "expected Started, one delta, Completed");
+        assert!(stream.demonstrated_generation());
+    }
+
+    #[tokio::test]
+    async fn a_completion_with_no_deltas_demonstrates_nothing() {
+        let (sink, mut stream) = generation_stream(request());
+        sink.complete(summary()).await;
+        while stream.next().await.is_some() {}
+        assert!(
+            !stream.demonstrated_generation(),
+            "completing without content is not demonstrated generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn collecting_a_stream_rebuilds_the_whole_result() {
+        let (mut sink, mut stream) = generation_stream(request());
+        sink.delta("Hel".to_owned()).await;
+        sink.delta("lo".to_owned()).await;
+        sink.complete(summary()).await;
+
+        let result = stream.collect().await.expect("completes");
+        assert_eq!(result.text, "Hello");
+        assert_eq!(result.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn collecting_a_truncated_stream_is_an_error_rather_than_a_partial_result() {
+        let (mut sink, mut stream) = generation_stream(request());
+        sink.delta("half an answer".to_owned()).await;
+        drop(sink);
+        assert!(stream.collect().await.is_err());
+    }
 
     fn embedding(index: usize, values: &[f32]) -> Embedding {
         Embedding {

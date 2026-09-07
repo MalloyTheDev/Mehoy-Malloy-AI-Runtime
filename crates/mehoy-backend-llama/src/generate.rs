@@ -10,6 +10,17 @@
 //! generated `text` and a `finish_reason` of `length` or `stop`, alongside a `usage`
 //! object with `prompt_tokens` and `completion_tokens`.
 //!
+//! A streaming request returns `text/event-stream`. Each event carries the same
+//! `choices` shape with an incremental `text` and a null `finish_reason`, the last
+//! content event carries the real `finish_reason` and a `usage` object, and the
+//! engine then sends `data: [DONE]`. Streaming and non-streaming were observed to
+//! produce identical text and identical usage counts for the same prompt at
+//! temperature zero with a fixed seed.
+//!
+//! None of that is assumed anywhere below. The terminal event is whatever reports
+//! a finish reason, `usage` is optional, and the `[DONE]` marker is accepted but
+//! not required, because a second engine will differ in exactly these details.
+//!
 //! # Parameters
 //!
 //! Only the portable set from ADR-0008 is sent, and only when the caller set it.
@@ -26,9 +37,14 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 
-use mehoy_core::inference::{FinishReason, GenerateTextRequest, GenerationResult, GenerationUsage};
+use mehoy_core::id::RequestId;
+use mehoy_core::inference::{
+    FinishReason, GenerateTextRequest, GenerationResult, GenerationSink, GenerationStream,
+    GenerationStreamError, GenerationSummary, GenerationUsage, generation_stream,
+};
 
 use crate::channel::BackendChannel;
+use crate::sse::SseDecoder;
 
 /// The engine's completion path.
 pub const COMPLETIONS_PATH: &str = "/v1/completions";
@@ -94,6 +110,14 @@ struct WireRequest<'a> {
     seed: Option<u64>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     stop: &'a [String],
+    /// Omitted when false, so a non-streaming request is byte-identical to
+    /// what it was before streaming existed.
+    #[serde(skip_serializing_if = "is_unset")]
+    stream: bool,
+}
+
+fn is_unset(streaming: &bool) -> bool {
+    !*streaming
 }
 
 #[derive(Deserialize)]
@@ -164,6 +188,7 @@ pub async fn generate(
         temperature: parameters.temperature,
         seed: parameters.seed,
         stop: &parameters.stop,
+        stream: false,
     })
     .map_err(|err| GenerateError::MalformedResponse {
         detail: format!("cannot encode the request: {err}"),
@@ -276,6 +301,258 @@ async fn post(
     Ok((status, bytes))
 }
 
+/// The marker this engine sends after its final event.
+const DONE_MARKER: &str = "[DONE]";
+
+/// How long the backend may go silent mid-stream before the stream is abandoned.
+///
+/// A backend that stops sending without closing the connection is
+/// indistinguishable from one that has hung, and waiting forever turns that into a
+/// leaked task and a consumer that never learns anything. This is a liveness
+/// ceiling, not a token budget, and not cancellation.
+const IDLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Starts a streaming generation against a running backend.
+///
+/// Resolves once the backend has accepted the request and the response has begun,
+/// which is exactly what [`GenerationEvent::Started`] claims. Content arrives
+/// afterwards through the returned stream.
+///
+/// Backpressure is real: the returned stream has a bounded buffer, and this
+/// adapter stops reading the backend's socket once that buffer is full, so a slow
+/// consumer slows the backend rather than accumulating in this process. Dropping
+/// the stream stops the reader at its next event.
+///
+/// # Errors
+///
+/// Returns [`GenerationStreamError`] when the request cannot be delivered or the
+/// backend refuses it outright. A failure occurring after the stream is
+/// established is reported through the stream instead.
+pub async fn stream(
+    channel: &BackendChannel,
+    request: &GenerateTextRequest,
+    request_id: RequestId,
+) -> Result<GenerationStream, GenerationStreamError> {
+    let parameters = &request.parameters;
+    let body = serde_json::to_vec(&WireRequest {
+        prompt: request.input.as_str(),
+        n_predict: parameters.max_output_tokens,
+        temperature: parameters.temperature,
+        seed: parameters.seed,
+        stop: &parameters.stop,
+        stream: true,
+    })
+    .map_err(|err| GenerationStreamError::Transport {
+        detail: format!("cannot encode the request: {err}"),
+    })?;
+
+    let opened = tokio::time::timeout(REQUEST_BUDGET, open(channel, body))
+        .await
+        .map_err(|_| GenerationStreamError::Transport {
+            detail: format!(
+                "the backend did not respond within {}s",
+                REQUEST_BUDGET.as_secs()
+            ),
+        })??;
+
+    let (sink, stream) = generation_stream(request_id);
+    tokio::spawn(read(opened, sink));
+    Ok(stream)
+}
+
+/// A backend response whose body has not been read yet.
+struct OpenStream {
+    body: hyper::body::Incoming,
+    connection: tokio::task::JoinHandle<()>,
+}
+
+/// Sends the request and returns once the response has begun.
+///
+/// A non-success status is resolved here rather than through the stream. A request
+/// the backend never accepted has no stream to report through, and delivering it
+/// as a mid-stream failure would imply generation had started.
+async fn open(
+    channel: &BackendChannel,
+    body: Vec<u8>,
+) -> Result<OpenStream, GenerationStreamError> {
+    let transport = TcpStream::connect(channel.address()).await.map_err(|err| {
+        GenerationStreamError::Transport {
+            detail: err.to_string(),
+        }
+    })?;
+
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(transport))
+        .await
+        .map_err(|err| GenerationStreamError::Transport {
+            detail: err.to_string(),
+        })?;
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(COMPLETIONS_PATH)
+        .header(header::HOST, channel.host())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "text/event-stream")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", channel.secret().expose()),
+        )
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|err| GenerationStreamError::Transport {
+            detail: err.to_string(),
+        })?;
+
+    let response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(err) => {
+            connection.abort();
+            return Err(GenerationStreamError::Transport {
+                detail: err.to_string(),
+            });
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.into_body().collect().await.map_or_else(
+            |err| err.to_string(),
+            |collected| classify(status, &collected.to_bytes()).to_string(),
+        );
+        connection.abort();
+        return Err(GenerationStreamError::Refused { detail });
+    }
+
+    Ok(OpenStream {
+        body: response.into_body(),
+        connection,
+    })
+}
+
+/// Drives the response body until the generation ends.
+///
+/// Every exit path ends the sink exactly once, so a consumer always learns an
+/// outcome rather than watching the stream simply stop. The one exception is a
+/// consumer that has gone away, which has nothing left to be told.
+async fn read(opened: OpenStream, mut sink: GenerationSink) {
+    let OpenStream {
+        mut body,
+        connection,
+    } = opened;
+    let mut decoder = SseDecoder::default();
+    let mut terminal: Option<GenerationSummary> = None;
+
+    let outcome: Result<EndOfBody, GenerationStreamError> = 'body: loop {
+        let frame = match tokio::time::timeout(IDLE_BUDGET, body.frame()).await {
+            Err(_) => {
+                break 'body Err(GenerationStreamError::UnexpectedEnd {
+                    detail: format!("the backend sent nothing for {}s", IDLE_BUDGET.as_secs()),
+                });
+            }
+            Ok(None) => break 'body Ok(EndOfBody::Closed),
+            Ok(Some(Err(err))) => {
+                break 'body Err(GenerationStreamError::Transport {
+                    detail: err.to_string(),
+                });
+            }
+            Ok(Some(Ok(frame))) => frame,
+        };
+
+        let Some(chunk) = frame.data_ref() else {
+            continue;
+        };
+
+        let payloads = match decoder.push(chunk) {
+            Ok(payloads) => payloads,
+            Err(detail) => break 'body Err(GenerationStreamError::MalformedEvent { detail }),
+        };
+
+        for payload in payloads {
+            if payload.trim() == DONE_MARKER {
+                break 'body Ok(EndOfBody::Marked);
+            }
+
+            let parsed: WireResponse = match serde_json::from_str(&payload) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    break 'body Err(GenerationStreamError::MalformedEvent {
+                        detail: describe(&err, &payload),
+                    });
+                }
+            };
+
+            let Some(choice) = parsed.choices.into_iter().next() else {
+                continue;
+            };
+
+            // Recorded before the text is handed over, so a terminal event that
+            // also carries content still reports why generation stopped.
+            if let Some(reported) = choice.finish_reason.as_deref() {
+                terminal = Some(GenerationSummary {
+                    finish_reason: finish_reason_for(Some(reported)),
+                    usage: parsed.usage.map(|usage| GenerationUsage {
+                        input_tokens: usage.prompt_tokens,
+                        output_tokens: usage.completion_tokens,
+                    }),
+                });
+            }
+
+            if !sink.delta(choice.text).await {
+                connection.abort();
+                return;
+            }
+        }
+    };
+
+    connection.abort();
+
+    match outcome {
+        Err(error) => sink.fail(error).await,
+        Ok(end) => match terminal {
+            Some(summary) => sink.complete(summary).await,
+            None => {
+                let detail = match end {
+                    EndOfBody::Marked => {
+                        "the backend ended the stream without reporting why generation stopped"
+                            .to_owned()
+                    }
+                    EndOfBody::Closed if decoder.has_partial_event() => {
+                        "the backend closed the connection part way through an event".to_owned()
+                    }
+                    EndOfBody::Closed => {
+                        "the backend closed the connection before completing".to_owned()
+                    }
+                };
+                sink.fail(GenerationStreamError::UnexpectedEnd { detail })
+                    .await;
+            }
+        },
+    }
+}
+
+/// How the response body stopped producing events.
+enum EndOfBody {
+    /// The engine sent its end-of-stream marker.
+    Marked,
+    /// The body ended without one.
+    Closed,
+}
+
+/// Describes an unparseable event without quoting all of it.
+///
+/// The payload is backend output of unbounded size, and the useful part for
+/// diagnosis is its beginning.
+fn describe(error: &serde_json::Error, payload: &str) -> String {
+    const SHOWN: usize = 120;
+    let mut excerpt: String = payload.chars().take(SHOWN).collect();
+    if excerpt.len() < payload.len() {
+        excerpt.push_str("...");
+    }
+    format!("{error}, in: {excerpt}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +566,7 @@ mod tests {
             temperature: request.parameters.temperature,
             seed: request.parameters.seed,
             stop: &request.parameters.stop,
+            stream: false,
         };
         serde_json::to_value(&wire).expect("encodes")
     }
