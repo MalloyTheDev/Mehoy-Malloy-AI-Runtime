@@ -59,6 +59,51 @@ impl fmt::Display for Compatibility {
     }
 }
 
+/// How the backend should be started for a given artifact.
+///
+/// Decided here rather than by a caller, because the flag that selects it is this
+/// engine's vocabulary. A runtime that had to know the flag exists would be
+/// carrying backend detail it has no business holding, and a second backend would
+/// need the caller changed rather than only the adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// The engine's ordinary mode.
+    General,
+    /// Dedicated embedding mode.
+    ///
+    /// Measured on build 9010: without it the embeddings endpoint answers `501`
+    /// with `not_supported_error`, so an embedding model started in the general
+    /// mode loads successfully and then refuses every request it exists to serve.
+    Embedding,
+}
+
+/// Chooses how to start the backend for an artifact.
+///
+/// A heuristic, and deliberately a conservative one: choosing embedding mode for a
+/// generative model would disable generation, so only an architecture that exists
+/// to produce embeddings and carries no conversation template qualifies. A wrong
+/// answer surfaces as a clear refusal from the engine rather than as silence.
+#[must_use]
+pub fn launch_mode(descriptor: &ModelDescriptor) -> LaunchMode {
+    let embedding_oriented = descriptor
+        .architecture
+        .as_deref()
+        .is_some_and(|architecture| {
+            EMBEDDING_ORIENTED
+                .iter()
+                .any(|family| architecture.contains(family))
+        });
+
+    if embedding_oriented && !descriptor.has_chat_template {
+        LaunchMode::Embedding
+    } else {
+        LaunchMode::General
+    }
+}
+
+/// Architecture families that exist to produce embeddings.
+const EMBEDDING_ORIENTED: [&str; 1] = ["bert"];
+
 /// Architectures this backend is known not to serve as a standalone model.
 ///
 /// A multimodal projector is a companion to another model rather than something

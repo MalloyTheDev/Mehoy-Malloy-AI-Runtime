@@ -2,6 +2,11 @@
 
 A local-first, backend-agnostic AI model runtime.
 
+Not a language-model runtime. Text generation is intended to be one task among many
+rather than the assumed default, so embeddings, reranking, classification, vision,
+audio, and generative media can arrive through further backends without a redesign.
+See [ADR-0006](docs/adr/0006-general-model-runtime-not-an-llm-runtime.md).
+
 ## Status
 
 Early. There is no inference yet.
@@ -31,11 +36,15 @@ get right before anything else is built on top of it.
 - Loading a registered artifact into a backend, producing a live in-memory model
   instance. Startup is transactional: a failure at any stage, including after the
   backend is healthy, leaves no worker, credential, or instance behind
+- Embeddings, end to end: a real authenticated request through the backend adapter,
+  structurally validated, promoting the capability from indicated to verified only
+  on success
 
 **Not implemented**
 
-- Inference of any kind, and therefore no token streaming or cancellation. A loaded
-  model is resident and reachable; no request has been served
+- Text generation, and therefore no token streaming or cancellation
+- Any model class other than text embeddings. Nothing prevents them; nothing
+  implements them yet
 - Taking ownership of an artifact into a managed store. Registration records where
   a file is; it never copies or moves it
 - Backend installation or download. The executable is configured explicitly
@@ -52,9 +61,9 @@ get right before anything else is built on top of it.
   supervision can be proven against a controllable worker; the llama.cpp backend
   uses its health endpoint instead.
 - Backend readiness means the backend loaded the artifact and accepts authenticated
-  requests. It is **not** evidence that any particular kind of request works. Model
-  capabilities are tracked separately and start out unknown; only an actual request
-  of that kind can mark one verified, and none has been made yet.
+  requests. It is **not** evidence that any particular kind of request works. Only
+  performing a task verifies it, and a verification belongs to the live instance and
+  the backend build that produced it, not permanently to the artifact.
 
 Architecture decisions are recorded in [docs/adr](docs/adr/README.md). The research
 behind them is in

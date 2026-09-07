@@ -312,6 +312,8 @@ dependencies = [
  "hyper-util",
  "libc",
  "mehoy-core",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

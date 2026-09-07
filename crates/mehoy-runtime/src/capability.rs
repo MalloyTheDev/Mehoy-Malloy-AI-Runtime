@@ -20,6 +20,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Instant;
+
+use mehoy_backend_llama::BackendIdentity;
 
 /// A thing a model might be able to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -53,51 +56,51 @@ impl fmt::Display for ModelCapability {
 /// Where a capability claim came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityEvidence {
-    /// The artifact's metadata suggests it.
-    Declared,
-    /// A running backend reports offering it.
-    BackendReported,
-    /// A request of this kind was actually made and answered.
-    Probed,
-}
-
-impl CapabilityEvidence {
-    /// Whether this evidence demonstrates the capability rather than asserting it.
-    #[must_use]
-    pub fn is_demonstration(self) -> bool {
-        matches!(self, Self::Probed)
-    }
+    /// The artifact's own metadata suggests it.
+    Metadata,
+    /// A running backend reports being able to serve it.
+    BackendSupported,
 }
 
 impl fmt::Display for CapabilityEvidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Declared => "declared by the artifact",
-            Self::BackendReported => "reported by the backend",
-            Self::Probed => "demonstrated by a request",
+            Self::Metadata => "suggested by the artifact metadata",
+            Self::BackendSupported => "reported by the backend",
         })
     }
 }
 
 /// How strongly a capability is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The ladder runs from nothing, through what the artifact claims, through what a
+/// backend says it can do, to what was actually performed. Only the last rung is a
+/// demonstration; the others are assertions from different sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityState {
     /// Nothing establishes it either way.
     Unknown,
     /// Something suggests it, but it has not been demonstrated.
     Indicated { by: CapabilityEvidence },
-    /// It has been demonstrated.
-    Verified,
+    /// It was performed successfully.
+    ///
+    /// Carries which backend build did it, because an artifact supporting a task
+    /// and a particular build having performed it are different claims. A different
+    /// backend inherits no demonstration from this one.
+    Verified {
+        at: Instant,
+        backend: Option<BackendIdentity>,
+    },
 }
 
 impl CapabilityState {
     /// Whether the capability has actually been demonstrated.
     ///
-    /// Callers that must not guess should branch on this rather than on whether a
-    /// capability is merely present in the map.
+    /// Callers that must not guess branch on this rather than on whether a
+    /// capability appears at all.
     #[must_use]
-    pub fn is_verified(self) -> bool {
-        matches!(self, Self::Verified)
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified { .. })
     }
 }
 
@@ -106,7 +109,10 @@ impl fmt::Display for CapabilityState {
         match self {
             Self::Unknown => f.write_str("unknown"),
             Self::Indicated { by } => write!(f, "indicated ({by})"),
-            Self::Verified => f.write_str("verified"),
+            Self::Verified { backend, .. } => match backend {
+                Some(backend) => write!(f, "verified on {backend}"),
+                None => f.write_str("verified"),
+            },
         }
     }
 }
@@ -137,13 +143,19 @@ impl ModelCapabilities {
         }
     }
 
-    /// Records that a capability was demonstrated.
+    /// Records that a capability was demonstrated by a specific backend.
     ///
-    /// Only reachable from an actual probe. Nothing derived from metadata may call
-    /// this, which is why it takes no evidence argument: there is only one kind of
-    /// evidence that justifies it.
-    pub fn verify(&mut self, capability: ModelCapability) {
-        self.entries.insert(capability, CapabilityState::Verified);
+    /// Only reachable from an actual execution. Nothing derived from metadata may
+    /// call this, and it takes the backend that did it: a demonstration without a
+    /// demonstrator is just another assertion.
+    pub fn verify(&mut self, capability: ModelCapability, backend: Option<BackendIdentity>) {
+        self.entries.insert(
+            capability,
+            CapabilityState::Verified {
+                at: Instant::now(),
+                backend,
+            },
+        );
     }
 
     /// How strongly a capability is known.
@@ -151,7 +163,7 @@ impl ModelCapabilities {
     pub fn state(&self, capability: ModelCapability) -> CapabilityState {
         self.entries
             .get(&capability)
-            .copied()
+            .cloned()
             .unwrap_or(CapabilityState::Unknown)
     }
 
@@ -162,8 +174,8 @@ impl ModelCapabilities {
     }
 
     /// Every capability with something known about it.
-    pub fn entries(&self) -> impl Iterator<Item = (ModelCapability, CapabilityState)> + '_ {
-        self.entries.iter().map(|(name, state)| (*name, *state))
+    pub fn entries(&self) -> impl Iterator<Item = (ModelCapability, &CapabilityState)> {
+        self.entries.iter().map(|(name, state)| (*name, state))
     }
 }
 
@@ -186,7 +198,7 @@ pub fn indicated_by_metadata(
     if has_chat_template {
         capabilities.indicate(
             ModelCapability::TextGeneration,
-            CapabilityEvidence::Declared,
+            CapabilityEvidence::Metadata,
         );
     }
 
@@ -197,7 +209,7 @@ pub fn indicated_by_metadata(
         && architecture.contains("bert")
         && embedding_length.is_some()
     {
-        capabilities.indicate(ModelCapability::Embeddings, CapabilityEvidence::Declared);
+        capabilities.indicate(ModelCapability::Embeddings, CapabilityEvidence::Metadata);
     }
 
     capabilities
@@ -225,7 +237,7 @@ mod tests {
         assert_eq!(
             capabilities.state(ModelCapability::TextGeneration),
             CapabilityState::Indicated {
-                by: CapabilityEvidence::Declared
+                by: CapabilityEvidence::Metadata
             }
         );
         assert!(!capabilities.is_verified(ModelCapability::TextGeneration));
@@ -243,7 +255,7 @@ mod tests {
         assert_eq!(
             capabilities.state(ModelCapability::Embeddings),
             CapabilityState::Indicated {
-                by: CapabilityEvidence::Declared
+                by: CapabilityEvidence::Metadata
             }
         );
     }
@@ -268,8 +280,8 @@ mod tests {
     #[test]
     fn a_demonstration_outranks_a_later_assertion() {
         let mut capabilities = ModelCapabilities::new();
-        capabilities.verify(ModelCapability::Embeddings);
-        capabilities.indicate(ModelCapability::Embeddings, CapabilityEvidence::Declared);
+        capabilities.verify(ModelCapability::Embeddings, None);
+        capabilities.indicate(ModelCapability::Embeddings, CapabilityEvidence::Metadata);
         assert!(
             capabilities.is_verified(ModelCapability::Embeddings),
             "an assertion must not downgrade a demonstration"
@@ -277,10 +289,30 @@ mod tests {
     }
 
     #[test]
-    fn only_probing_counts_as_a_demonstration() {
-        assert!(CapabilityEvidence::Probed.is_demonstration());
-        assert!(!CapabilityEvidence::Declared.is_demonstration());
-        assert!(!CapabilityEvidence::BackendReported.is_demonstration());
+    fn no_indication_however_authoritative_reaches_verified() {
+        // Both rungs below verification are assertions. Neither is promoted by
+        // being repeated or by coming from a more authoritative source.
+        let mut capabilities = ModelCapabilities::new();
+        capabilities.indicate(ModelCapability::Embeddings, CapabilityEvidence::Metadata);
+        assert!(!capabilities.is_verified(ModelCapability::Embeddings));
+        capabilities.indicate(
+            ModelCapability::Embeddings,
+            CapabilityEvidence::BackendSupported,
+        );
+        assert!(
+            !capabilities.is_verified(ModelCapability::Embeddings),
+            "a backend saying it can do something is not the same as having done it"
+        );
+    }
+
+    #[test]
+    fn a_verification_records_that_it_was_demonstrated() {
+        let mut capabilities = ModelCapabilities::new();
+        capabilities.verify(ModelCapability::Embeddings, None);
+        assert!(matches!(
+            capabilities.state(ModelCapability::Embeddings),
+            CapabilityState::Verified { .. }
+        ));
     }
 
     #[test]

@@ -24,10 +24,11 @@ use mehoy_backend_llama::{
     BackendError, LlamaCppBackend, LlamaCppWorkerSpec, ModelDescriptor, RunningBackend,
 };
 use mehoy_core::id::WorkerId;
+use mehoy_core::inference::{self, EmbedRequest, EmbeddingResult};
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::{ArtifactId, ArtifactRegistry, ArtifactState, ModelArtifact, RegistryError};
 
-use crate::capability::indicated_by_metadata;
+use crate::capability::{ModelCapability, indicated_by_metadata};
 use crate::instance::{InstanceId, ModelInstance};
 
 /// Why an artifact could not be brought up.
@@ -52,6 +53,16 @@ pub enum LoadError {
     ///
     /// The backend is stopped before this is returned.
     Instance { reason: String },
+    /// The instance is not in a state that can serve requests.
+    NotUsable { state: String },
+    /// The backend refused or could not serve the request.
+    ///
+    /// Carries the backend's own account rather than flattening it, so an
+    /// unsupported mode, a refused credential, and a rejected input stay
+    /// distinguishable.
+    Inference { detail: String },
+    /// The backend answered, but with something that cannot be used.
+    UnusableResult { detail: String },
 }
 
 impl fmt::Display for LoadError {
@@ -75,6 +86,16 @@ impl fmt::Display for LoadError {
                 write!(
                     f,
                     "the backend started but the instance could not be created: {reason}"
+                )
+            }
+            Self::NotUsable { state } => {
+                write!(f, "the instance cannot serve requests while it is {state}")
+            }
+            Self::Inference { detail } => write!(f, "{detail}"),
+            Self::UnusableResult { detail } => {
+                write!(
+                    f,
+                    "the backend returned a result that cannot be used: {detail}"
                 )
             }
         }
@@ -118,6 +139,63 @@ impl LoadedModel {
     #[must_use]
     pub fn backend(&self) -> &RunningBackend {
         &self.backend
+    }
+
+    /// Performs an embedding request against this instance.
+    ///
+    /// Structural validation happens before anything is returned: the number of
+    /// vectors must match the number of inputs, every vector must be non-empty with
+    /// finite components, and the dimensions must agree. A vector containing a
+    /// non-finite value is not a lesser problem than an error response, because it
+    /// silently poisons every distance computed from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::NotUsable`] when the instance is not ready,
+    /// [`LoadError::Inference`] when the backend refuses, and
+    /// [`LoadError::UnusableResult`] when the response is structurally wrong.
+    pub async fn embed(&self, request: &EmbedRequest) -> Result<EmbeddingResult, LoadError> {
+        if !self.instance.state().is_usable() {
+            return Err(LoadError::NotUsable {
+                state: self.instance.state().to_string(),
+            });
+        }
+
+        let result = mehoy_backend_llama::embed(self.backend.channel(), request)
+            .await
+            .map_err(|source| LoadError::Inference {
+                detail: source.to_string(),
+            })?;
+
+        inference::validate(request, &result).map_err(|defect| LoadError::UnusableResult {
+            detail: defect.to_string(),
+        })?;
+
+        Ok(result)
+    }
+
+    /// Performs an embedding request and, if it succeeds, records that this backend
+    /// demonstrated the capability.
+    ///
+    /// The only route by which [`ModelCapability::Embeddings`] becomes verified.
+    /// Nothing derived from metadata reaches it, and a failed request leaves the
+    /// capability exactly where it was rather than downgrading it: a transient
+    /// refusal is not evidence of absence.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`LoadedModel::embed`] returns. The capability is unchanged
+    /// on failure.
+    pub async fn verify_embeddings(
+        &mut self,
+        request: &EmbedRequest,
+    ) -> Result<EmbeddingResult, LoadError> {
+        let result = self.embed(request).await?;
+        let backend = self.backend.identity().cloned();
+        self.instance
+            .capabilities_mut()
+            .verify(ModelCapability::Embeddings, backend);
+        Ok(result)
     }
 
     /// Stops the backend and destroys the instance.
@@ -175,6 +253,9 @@ impl ModelLoader {
         // already leaves nothing running.
         let spec = LlamaCppWorkerSpec {
             model_path: artifact.path.clone(),
+            // The same description the preflight judged. What the backend does with
+            // it, including how it chooses to start, is the backend's business.
+            descriptor,
             context_size: None,
             gpu_layers: None,
             deadlines,

@@ -20,11 +20,13 @@
 
 pub mod channel;
 pub mod compatibility;
+pub mod embed;
 pub mod health;
 pub mod identity;
 
 pub use channel::{BackendChannel, ChannelSecret, SecretFile};
-pub use compatibility::{Compatibility, ModelDescriptor};
+pub use compatibility::{Compatibility, LaunchMode, ModelDescriptor};
+pub use embed::{EmbedError, embed};
 pub use health::{CredentialState, Readiness, StartupPhase};
 pub use identity::{BackendFamily, BackendIdentity};
 
@@ -66,6 +68,12 @@ pub enum GpuLayerPolicy {
 #[derive(Debug, Clone)]
 pub struct LlamaCppWorkerSpec {
     pub model_path: PathBuf,
+    /// What the runtime knows about the artifact.
+    ///
+    /// Passed as plain description rather than as instructions. The runtime does
+    /// not choose a launch mode or name a flag; this crate reads the description
+    /// and decides, so backend vocabulary stays inside the backend.
+    pub descriptor: ModelDescriptor,
     pub context_size: Option<u32>,
     pub gpu_layers: Option<GpuLayerPolicy>,
     pub deadlines: Deadlines,
@@ -77,6 +85,7 @@ impl LlamaCppWorkerSpec {
     pub fn new(model_path: impl Into<PathBuf>) -> Self {
         Self {
             model_path: model_path.into(),
+            descriptor: ModelDescriptor::default(),
             context_size: None,
             gpu_layers: None,
             deadlines: Deadlines::default(),
@@ -275,6 +284,11 @@ impl LlamaCppBackend {
             // The backend is private runtime plumbing, not a user-facing surface.
             "--no-webui".to_owned(),
         ];
+
+        // Chosen here from the description, not requested by the caller.
+        if compatibility::launch_mode(&spec.descriptor) == compatibility::LaunchMode::Embedding {
+            args.push("--embedding".to_owned());
+        }
         if let Some(context) = spec.context_size {
             args.push("--ctx-size".to_owned());
             args.push(context.to_string());

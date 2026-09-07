@@ -18,6 +18,7 @@ Evidence labels follow the project claim discipline used elsewhere in `docs/`:
 | [0003](0003-protocol-first-vertical-slice.md) | Protocol defined first, validated through one minimal vertical slice | Accepted |
 | [0004](0004-local-transport-and-surface-split.md) | Local transport is HTTP over a Unix socket or named pipe, with control and inference on separate surfaces | Accepted |
 | [0005](0005-backend-channel-isolation-and-readiness.md) | Backend channels are private, and backend readiness is not inference | Accepted |
+| [0006](0006-general-model-runtime-not-an-llm-runtime.md) | A general model runtime, not a language-model runtime | Accepted |
 
 ## Open decisions
 

@@ -11,10 +11,12 @@
 
 pub mod event;
 pub mod id;
+pub mod inference;
 pub mod transport;
 pub mod worker;
 
 pub use event::{ExitCause, InferenceEvent, RuntimeEvent};
 pub use id::{IdAllocator, ModelId, RequestId, WorkerId};
+pub use inference::{EmbedRequest, Embedding, EmbeddingResult, Task, TaskId};
 pub use transport::{ClientStream, Endpoint, EndpointAddress, EndpointError, Stream};
 pub use worker::{ProcessWorker, WorkerHandle, WorkerSpec, WorkerState};

@@ -174,6 +174,15 @@ impl ModelInstance {
     pub(crate) fn set_state(&mut self, next: InstanceState) {
         self.state = next;
     }
+
+    /// Forces a state, for tests that need to reach one the happy path does not
+    /// pass through.
+    ///
+    /// Deliberately named so a production call site would look wrong.
+    #[doc(hidden)]
+    pub fn set_state_for_test(&mut self, next: InstanceState) {
+        self.state = next;
+    }
 }
 
 #[cfg(test)]
