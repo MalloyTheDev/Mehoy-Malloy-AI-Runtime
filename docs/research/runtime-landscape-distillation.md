@@ -2,6 +2,10 @@
 
 Status: research findings. Nothing in this document is implemented.
 
+Three of the four items under "Decision implications" have since been decided. See
+[docs/adr](../adr/README.md) for the records. This document is deliberately not revised to
+match them; it stands as the evidence that informed them.
+
 Evidence labels follow the project claim discipline: `[VERIFIED]`, `[OBSERVED]`,
 `[USER-PROVIDED]`, `[ASSUMPTION]`, `[INFERENCE]`, `[UNVERIFIED]`.
 
