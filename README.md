@@ -27,7 +27,8 @@ artifact format, one model at a time.
   crashed worker
 - Orphan cleanup, so no worker survives the abrupt death of the process that owns
   it. Verified on Windows via a Job Object, against both a stand-in worker and a
-  real `llama-server`; the Linux mechanism is implemented but unverified
+  real `llama-server`, and on Linux via `prctl(PR_SET_PDEATHSIG)`. macOS and the
+  BSDs have no equivalent mechanism and are not covered
 - A llama.cpp backend that locates and identifies an executable, starts it under
   supervision on a private loopback channel behind a per-worker secret, maps its
   health endpoint to a readiness state, and captures its output for diagnostics
