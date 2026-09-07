@@ -42,6 +42,29 @@ pub struct WorkerSpec {
     pub deadlines: Deadlines,
     /// How many output lines to retain for diagnostics.
     pub capture_lines: usize,
+    /// How this worker is asked to stop.
+    pub stop: StopProtocol,
+}
+
+/// How a worker is stopped.
+///
+/// Not every program implements a graceful stop, and pretending otherwise wastes a
+/// shutdown deadline on a request that will never be answered and then reports a
+/// timeout that was never a fault. The protocol is therefore a property of the
+/// worker rather than an assumption of the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopProtocol {
+    /// A line on standard input asks the worker to stop, and it is expected to
+    /// honour it. Failing to do so within the deadline is a fault worth reporting.
+    #[default]
+    ShutdownLine,
+    /// The worker implements no graceful stop, so termination is the defined way to
+    /// stop it.
+    ///
+    /// This is not the supervisor giving up. It is the agreed mechanism, so it is
+    /// not reported as a failure, and no deadline is spent waiting for a response
+    /// that was never going to come.
+    Terminate,
 }
 
 /// The three deadlines a supervised worker is held to.

@@ -45,6 +45,7 @@ fn spec(args: &[&str], deadlines: Deadlines) -> WorkerSpec {
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         deadlines,
         capture_lines: mehoy_core::worker::log::DEFAULT_CAPTURE_LINES,
+        stop: mehoy_core::worker::StopProtocol::ShutdownLine,
     }
 }
 
@@ -377,5 +378,71 @@ async fn readiness_output_is_retained_after_the_worker_stops() {
     assert!(
         output.contains("MEHOY-WORKER-READY"),
         "the readiness announcement should still be in the capture:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_with_no_stop_protocol_is_terminated_without_waiting() {
+    // Some programs implement no graceful stop. Sending a request they do not
+    // understand and then waiting out the deadline delays every shutdown and
+    // reports a timeout that describes the protocol rather than the worker.
+    //
+    // Termination is the agreed mechanism for such a worker, so it is neither slow
+    // nor a failure.
+    use mehoy_core::worker::StopProtocol;
+
+    let supervisor = ProcessWorker;
+    let mut spec = spec(&["--ignore-shutdown"], quick());
+    spec.stop = StopProtocol::Terminate;
+
+    let mut handle = supervisor.spawn(spec).await.expect("worker starts");
+    supervisor
+        .wait_ready(&mut handle)
+        .await
+        .expect("worker becomes ready");
+
+    let began = std::time::Instant::now();
+    let exit = supervisor
+        .shutdown(&mut handle)
+        .await
+        .expect("termination is the defined stop, not a failure");
+    let elapsed = began.elapsed();
+
+    assert_eq!(exit.cause, ExitCause::Requested);
+    assert_eq!(handle.pid(), None, "the worker survived termination");
+    assert!(
+        elapsed < handle.deadlines().shutdown,
+        "termination took {elapsed:?}, which suggests the shutdown deadline was \
+         spent waiting for a protocol this worker does not implement"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_that_does_implement_the_stop_protocol_still_reports_ignoring_it() {
+    // The other half: choosing termination for one worker must not stop the
+    // supervisor from reporting a worker that was asked politely and refused.
+    use mehoy_core::worker::StopProtocol;
+
+    let supervisor = ProcessWorker;
+    let deadlines = Deadlines {
+        shutdown: Duration::from_millis(400),
+        ..quick()
+    };
+    let mut spec = spec(&["--ignore-shutdown"], deadlines);
+    spec.stop = StopProtocol::ShutdownLine;
+
+    let mut handle = supervisor.spawn(spec).await.expect("worker starts");
+    supervisor
+        .wait_ready(&mut handle)
+        .await
+        .expect("worker becomes ready");
+
+    let err = supervisor
+        .shutdown(&mut handle)
+        .await
+        .expect_err("ignoring a protocol the worker implements is still a fault");
+    assert!(
+        matches!(err, WorkerError::ShutdownTimeout { .. }),
+        "expected a shutdown timeout, got {err}"
     );
 }

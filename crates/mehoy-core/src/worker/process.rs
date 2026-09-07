@@ -42,7 +42,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 
 use super::log::{LogHandle, LogStream};
-use super::{Deadlines, WorkerError, WorkerExit, WorkerReady, WorkerSpec, WorkerState};
+use super::{
+    Deadlines, StopProtocol, WorkerError, WorkerExit, WorkerReady, WorkerSpec, WorkerState,
+};
 use crate::event::ExitCause;
 use crate::id::WorkerId;
 
@@ -193,6 +195,7 @@ pub struct WorkerHandle {
     /// its final output is captured rather than lost to a race with the exit.
     drains: Vec<tokio::task::JoinHandle<()>>,
     deadlines: Deadlines,
+    stop: StopProtocol,
     /// Held for the worker's lifetime so that losing the daemon reaps the worker.
     #[cfg(windows)]
     _job: job::Job,
@@ -345,6 +348,7 @@ impl ProcessWorker {
             lines,
             drains,
             deadlines: spec.deadlines,
+            stop: spec.stop,
             #[cfg(windows)]
             _job: job,
         })
@@ -481,6 +485,23 @@ impl ProcessWorker {
         }
 
         let budget = handle.deadlines.shutdown;
+
+        // A worker with no graceful stop is terminated directly. Sending a request
+        // it does not implement and then waiting out the deadline would delay every
+        // shutdown and report a timeout that describes the protocol rather than the
+        // worker.
+        if handle.stop == StopProtocol::Terminate {
+            self.terminate(handle).await?;
+            handle.state = if handle.state == WorkerState::Stopping {
+                handle.state.transition_to(WorkerState::Absent)?
+            } else {
+                handle.state
+            };
+            return Ok(WorkerExit {
+                cause: ExitCause::Requested,
+            });
+        }
+
         let Some(child) = handle.child.as_mut() else {
             return Ok(WorkerExit {
                 cause: ExitCause::Requested,

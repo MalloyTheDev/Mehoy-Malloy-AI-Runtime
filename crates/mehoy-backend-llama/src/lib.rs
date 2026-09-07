@@ -19,10 +19,12 @@
 //! that distribution is its own subsystem. The executable is supplied explicitly.
 
 pub mod channel;
+pub mod compatibility;
 pub mod health;
 pub mod identity;
 
 pub use channel::{BackendChannel, ChannelSecret, SecretFile};
+pub use compatibility::{Compatibility, ModelDescriptor};
 pub use health::{CredentialState, Readiness, StartupPhase};
 pub use identity::{BackendFamily, BackendIdentity};
 
@@ -33,7 +35,8 @@ use std::process::Stdio;
 use mehoy_core::id::WorkerId;
 use mehoy_core::worker::log::DEFAULT_CAPTURE_LINES;
 use mehoy_core::worker::{
-    Deadlines, ProbeOutcome, ProcessWorker, WorkerError, WorkerHandle, WorkerReady, WorkerSpec,
+    Deadlines, ProbeOutcome, ProcessWorker, StopProtocol, WorkerError, WorkerHandle, WorkerReady,
+    WorkerSpec,
 };
 
 /// Environment variable naming the backend executable.
@@ -320,6 +323,11 @@ impl LlamaCppBackend {
             args: self.command_line(spec, &channel, &secret_file),
             deadlines: spec.deadlines,
             capture_lines: DEFAULT_CAPTURE_LINES,
+            // The backend implements no graceful stop protocol: a stop request on
+            // its standard input is simply ignored. Measured on build 9010, where it
+            // continued serving until its shutdown deadline expired. Termination is
+            // therefore the defined way to stop it, not a fallback.
+            stop: StopProtocol::Terminate,
         };
 
         let mut handle = supervisor

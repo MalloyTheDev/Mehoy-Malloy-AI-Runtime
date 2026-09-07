@@ -281,6 +281,7 @@ where
             health: Duration::from_secs(5),
         },
         capture_lines: mehoy_core::worker::log::DEFAULT_CAPTURE_LINES,
+        stop: mehoy_core::worker::StopProtocol::Terminate,
     };
 
     let supervisor = mehoy_core::worker::ProcessWorker;

@@ -1,0 +1,31 @@
+[package]
+name = "mehoy-runtime"
+description = "Joins registered artifacts to execution backends and owns live model instances."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# Test-only. Allows a failure to be injected after a backend has become ready, so
+# the rollback path can actually be exercised rather than assumed.
+fault-injection = []
+
+[dependencies]
+mehoy-backend-llama = { path = "../mehoy-backend-llama", version = "0.1.0" }
+mehoy-core.workspace = true
+mehoy-registry = { path = "../mehoy-registry", version = "0.1.0" }
+
+getrandom = "0.4"
+
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[dev-dependencies]
+mehoy-runtime = { path = ".", features = ["fault-injection"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

@@ -39,6 +39,7 @@ async fn main() {
             health: Duration::from_secs(2),
         },
         capture_lines: mehoy_core::worker::log::DEFAULT_CAPTURE_LINES,
+        stop: mehoy_core::worker::StopProtocol::ShutdownLine,
     };
 
     let mut handle = match supervisor.spawn(spec).await {

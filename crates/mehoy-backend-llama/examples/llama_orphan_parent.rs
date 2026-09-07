@@ -66,6 +66,7 @@ async fn main() {
             health: Duration::from_secs(5),
         },
         capture_lines: DEFAULT_CAPTURE_LINES,
+        stop: mehoy_core::worker::StopProtocol::Terminate,
     };
 
     let supervisor = ProcessWorker;

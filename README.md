@@ -28,11 +28,14 @@ get right before anything else is built on top of it.
 - A GGUF reader and a durable artifact registry. Containers are inspected by the
   runtime itself rather than by a backend, validated as untrusted input, and
   recorded without being copied or moved
+- Loading a registered artifact into a backend, producing a live in-memory model
+  instance. Startup is transactional: a failure at any stage, including after the
+  backend is healthy, leaves no worker, credential, or instance behind
 
 **Not implemented**
 
-- Loading a registered artifact into a backend, and therefore no inference, token
-  streaming, or cancellation
+- Inference of any kind, and therefore no token streaming or cancellation. A loaded
+  model is resident and reachable; no request has been served
 - Taking ownership of an artifact into a managed store. Registration records where
   a file is; it never copies or moves it
 - Backend installation or download. The executable is configured explicitly
@@ -48,9 +51,10 @@ get right before anything else is built on top of it.
 - The worker readiness and shutdown line protocol is provisional. It exists so
   supervision can be proven against a controllable worker; the llama.cpp backend
   uses its health endpoint instead.
-- Backend readiness means the process answers and reports a serving state. It is
-  **not** evidence that generation works. No model has been loaded and no
-  generation has been performed, so nothing has established that yet.
+- Backend readiness means the backend loaded the artifact and accepts authenticated
+  requests. It is **not** evidence that any particular kind of request works. Model
+  capabilities are tracked separately and start out unknown; only an actual request
+  of that kind can mark one verified, and none has been made yet.
 
 Architecture decisions are recorded in [docs/adr](docs/adr/README.md). The research
 behind them is in
