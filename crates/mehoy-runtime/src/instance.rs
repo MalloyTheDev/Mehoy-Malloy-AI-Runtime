@@ -75,7 +75,6 @@ pub enum InstanceState {
     /// particular kind of request will succeed, which is what
     /// [`crate::capability`] exists to track separately.
     BackendReady,
-    Stopping,
     Failed(InstanceFailure),
 }
 
@@ -98,8 +97,7 @@ impl InstanceState {
         matches!(
             (self, next),
             (Self::Starting, Self::BackendReady | Self::Failed(_))
-                | (Self::BackendReady, Self::Stopping | Self::Failed(_))
-                | (Self::Stopping, Self::Failed(_))
+                | (Self::BackendReady, Self::Failed(_))
         )
     }
 }
@@ -109,7 +107,6 @@ impl fmt::Display for InstanceState {
         match self {
             Self::Starting => f.write_str("starting"),
             Self::BackendReady => f.write_str("backend ready"),
-            Self::Stopping => f.write_str("stopping"),
             Self::Failed(failure) => write!(f, "failed: {}", failure.reason),
         }
     }
@@ -208,7 +205,6 @@ mod tests {
     fn only_backend_ready_is_usable() {
         assert!(InstanceState::BackendReady.is_usable());
         assert!(!InstanceState::Starting.is_usable());
-        assert!(!InstanceState::Stopping.is_usable());
         assert!(!failure().is_usable());
     }
 
@@ -223,11 +219,14 @@ mod tests {
     #[test]
     fn the_happy_path_is_permitted() {
         assert!(InstanceState::Starting.can_transition_to(&InstanceState::BackendReady));
-        assert!(InstanceState::BackendReady.can_transition_to(&InstanceState::Stopping));
     }
 
     #[test]
-    fn readiness_cannot_be_reached_without_starting() {
-        assert!(!InstanceState::Stopping.can_transition_to(&InstanceState::BackendReady));
+    fn bringing_up_says_nothing_about_teardown() {
+        // Whether an instance is still serving is a separate question with its own
+        // authority. This type used to carry a stopping state as well, which meant
+        // two places described the same thing and could disagree.
+        assert!(!InstanceState::BackendReady.can_transition_to(&InstanceState::Starting));
+        assert!(InstanceState::BackendReady.is_usable());
     }
 }

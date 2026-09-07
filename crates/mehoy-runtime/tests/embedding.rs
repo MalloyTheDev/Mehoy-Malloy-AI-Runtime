@@ -347,27 +347,22 @@ async fn verification_does_not_survive_the_instance() {
 }
 
 #[tokio::test]
-async fn a_request_to_an_unusable_instance_is_refused() {
-    // Nothing is sent to a backend for an instance that is not ready, so a stopped
-    // instance produces a clear refusal rather than a transport error.
+async fn a_request_to_an_instance_that_is_not_serving_is_refused() {
+    // Nothing is sent to a backend for an instance that has stopped serving, so
+    // the caller gets a clear refusal rather than a transport error from a socket
+    // nobody is listening on.
     let _exclusive = exclusive().await;
-    with_embedding_model(|mut loaded| async move {
-        loaded
-            .instance_mut()
-            .set_state_for_test(mehoy_runtime::InstanceState::Stopping);
+    with_embedding_model(|loaded| async move {
+        loaded.unload().await.expect("unloads");
 
         let err = loaded
             .embed(&EmbedRequest::single("x"))
             .await
-            .expect_err("a stopping instance must not serve requests");
+            .expect_err("an unloaded instance must not serve requests");
         assert!(
             matches!(err, LoadError::NotUsable { .. }),
             "expected NotUsable, got {err}"
         );
-
-        loaded
-            .instance_mut()
-            .set_state_for_test(mehoy_runtime::InstanceState::BackendReady);
         loaded
     })
     .await;

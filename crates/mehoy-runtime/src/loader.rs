@@ -62,6 +62,11 @@ pub enum LoadError {
     Instance { reason: String },
     /// The instance is not in a state that can serve requests.
     NotUsable { state: String },
+    /// The work was stopped after being admitted.
+    ///
+    /// Distinct from a refusal: this request was accepted, started, and then told
+    /// to stop, most often because the instance serving it was unloaded.
+    Stopped { cause: CancellationCause },
     /// The request itself cannot be honoured.
     ///
     /// Refused before anything reaches a backend, so an unusable parameter reads as
@@ -106,6 +111,7 @@ impl fmt::Display for LoadError {
             Self::InvalidRequest { detail } => {
                 write!(f, "the request cannot be honoured: {detail}")
             }
+            Self::Stopped { cause } => write!(f, "the request was stopped: {cause}"),
             Self::Inference { detail } => write!(f, "{detail}"),
             Self::UnusableResult { detail } => {
                 write!(
@@ -336,6 +342,37 @@ impl LoadedModel {
         self.lifecycle().phase
     }
 
+    /// Admits one unit of backend work, or refuses it.
+    ///
+    /// Every task class goes through this, and nothing may reach a backend without
+    /// it. A task that checked readiness for itself and then called the backend
+    /// would be invisible to unloading, so it would neither be refused once the
+    /// instance stopped serving nor stopped when the instance was torn down. That
+    /// is a per-task lifecycle rather than a runtime one, and it gets less correct
+    /// with every task class added.
+    ///
+    /// The check and the registration are one operation under one lock, so a
+    /// request cannot be admitted moments after admission closed.
+    fn admit(&self) -> Result<RequestHandle, LoadError> {
+        let mut lifecycle = self.lifecycle();
+        if lifecycle.phase != LifecyclePhase::Serving {
+            return Err(LoadError::NotUsable {
+                state: lifecycle.phase.to_string(),
+            });
+        }
+        if !self.instance.state().is_usable() {
+            return Err(LoadError::NotUsable {
+                state: self.instance.state().to_string(),
+            });
+        }
+        lifecycle
+            .active
+            .retain(|_, existing| !existing.is_terminal());
+        let handle = RequestHandle::new(self.requests.request());
+        lifecycle.active.insert(handle.id(), handle.clone());
+        Ok(handle)
+    }
+
     /// Performs an embedding request against this instance.
     ///
     /// Structural validation happens before anything is returned: the number of
@@ -350,21 +387,35 @@ impl LoadedModel {
     /// [`LoadError::Inference`] when the backend refuses, and
     /// [`LoadError::UnusableResult`] when the response is structurally wrong.
     pub async fn embed(&self, request: &EmbedRequest) -> Result<EmbeddingResult, LoadError> {
-        if !self.instance.state().is_usable() {
-            return Err(LoadError::NotUsable {
-                state: self.instance.state().to_string(),
+        let handle = self.admit()?;
+        handle.mark_running();
+
+        let sent = tokio::select! {
+            biased;
+            cause = handle.token().cancelled() => {
+                handle.finish(RequestState::Cancelled);
+                return Err(LoadError::Stopped { cause });
+            }
+            sent = mehoy_backend_llama::embed(&self.channel, request) => sent,
+        };
+
+        let result = match sent {
+            Ok(result) => result,
+            Err(source) => {
+                handle.finish(RequestState::Failed);
+                return Err(LoadError::Inference {
+                    detail: source.to_string(),
+                });
+            }
+        };
+
+        if let Err(defect) = inference::validate(request, &result) {
+            handle.finish(RequestState::Failed);
+            return Err(LoadError::UnusableResult {
+                detail: defect.to_string(),
             });
         }
-
-        let result = mehoy_backend_llama::embed(&self.channel, request)
-            .await
-            .map_err(|source| LoadError::Inference {
-                detail: source.to_string(),
-            })?;
-
-        inference::validate(request, &result).map_err(|defect| LoadError::UnusableResult {
-            detail: defect.to_string(),
-        })?;
+        handle.finish(RequestState::Completed);
 
         Ok(result)
     }
@@ -409,12 +460,7 @@ impl LoadedModel {
         &self,
         request: &GenerateTextRequest,
     ) -> Result<GenerationResult, LoadError> {
-        if !self.instance.state().is_usable() {
-            return Err(LoadError::NotUsable {
-                state: self.instance.state().to_string(),
-            });
-        }
-
+        // Validated before admission, so an unusable request never occupies one.
         request
             .parameters
             .validate()
@@ -422,15 +468,35 @@ impl LoadedModel {
                 detail: invalid.to_string(),
             })?;
 
-        let result = mehoy_backend_llama::generate(&self.channel, request)
-            .await
-            .map_err(|source| LoadError::Inference {
-                detail: source.to_string(),
-            })?;
+        let handle = self.admit()?;
+        handle.mark_running();
 
-        inference::validate_generation(&result).map_err(|defect| LoadError::UnusableResult {
-            detail: defect.to_string(),
-        })?;
+        let sent = tokio::select! {
+            biased;
+            cause = handle.token().cancelled() => {
+                handle.finish(RequestState::Cancelled);
+                return Err(LoadError::Stopped { cause });
+            }
+            sent = mehoy_backend_llama::generate(&self.channel, request) => sent,
+        };
+
+        let result = match sent {
+            Ok(result) => result,
+            Err(source) => {
+                handle.finish(RequestState::Failed);
+                return Err(LoadError::Inference {
+                    detail: source.to_string(),
+                });
+            }
+        };
+
+        if let Err(defect) = inference::validate_generation(&result) {
+            handle.finish(RequestState::Failed);
+            return Err(LoadError::UnusableResult {
+                detail: defect.to_string(),
+            });
+        }
+        handle.finish(RequestState::Completed);
 
         Ok(result)
     }
@@ -497,12 +563,7 @@ impl LoadedModel {
         request: &GenerateTextRequest,
         budget: RequestBudget,
     ) -> Result<GenerationRequest, LoadError> {
-        if !self.instance.state().is_usable() {
-            return Err(LoadError::NotUsable {
-                state: self.instance.state().to_string(),
-            });
-        }
-
+        // Validated before admission, so an unusable request never occupies one.
         request
             .parameters
             .validate()
@@ -510,23 +571,7 @@ impl LoadedModel {
                 detail: invalid.to_string(),
             })?;
 
-        // The admission decision and the registration are one operation. Doing
-        // them separately is how a request gets accepted just after the instance
-        // stopped accepting any, with both halves looking individually correct.
-        let handle = {
-            let mut lifecycle = self.lifecycle();
-            if lifecycle.phase != LifecyclePhase::Serving {
-                return Err(LoadError::NotUsable {
-                    state: lifecycle.phase.to_string(),
-                });
-            }
-            lifecycle
-                .active
-                .retain(|_, existing| !existing.is_terminal());
-            let handle = RequestHandle::new(self.requests.request());
-            lifecycle.active.insert(handle.id(), handle.clone());
-            handle
-        };
+        let handle = self.admit()?;
         let request_id = handle.id();
 
         let stream = mehoy_backend_llama::start_generation(&self.channel, request, handle, budget);

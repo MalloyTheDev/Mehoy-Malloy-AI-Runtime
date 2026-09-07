@@ -29,8 +29,6 @@ Recorded here so they are not lost between records.
 
 | Decision | Blocking | Raised in |
 | --- | --- | --- |
-| Content-hash scope and eager or lazy computation for model artifacts | Yes, part of the first slice | [0003](0003-protocol-first-vertical-slice.md) |
-| Socket and pipe default locations, creation permissions, and stale-endpoint handling | Yes, part of the first slice | [0004](0004-local-transport-and-surface-split.md) |
 | Whether the inference surface ever gains a network listener, and what authenticates it | No, deferred by decision | [0004](0004-local-transport-and-surface-split.md) |
 | Whether the backend channel moves to a Unix socket on Unix, where the operating system enforces access | No | [0005](0005-backend-channel-isolation-and-readiness.md) |
 | How a backend is installed or distributed, as distinct from executed | No, out of scope for now | [0005](0005-backend-channel-isolation-and-readiness.md) |
@@ -45,6 +43,8 @@ Recorded here so they are not lost between records.
 | Decision | Resolved by |
 | --- | --- |
 | Local client transport and its authentication model, deferred by ADR-0001 | [0004](0004-local-transport-and-surface-split.md) |
+| Content-hash scope and eager or lazy computation for model artifacts | Implemented in `mehoy-registry`: hashed eagerly at registration, with size and nanosecond mtime used to detect drift without rehashing |
+| Socket and pipe default locations, creation permissions, and stale-endpoint handling | Implemented in `mehoy-core::transport`: per-user paths, owner-only directories on Unix and an explicit descriptor on Windows, with a connect probe distinguishing a stale endpoint from a running one |
 | Which generation parameters the runtime normalises | [0008](0008-minimal-portable-generation-parameters.md) |
 | What `GenerationEvent::Started` marks, corrected after measurement | [0009](0009-the-runtime-owns-requests-not-streams.md) |
-| Worker supervision contract: readiness, hang detection, draining, restart policy, orphan cleanup, deferred by ADR-0002 | Implemented in `mehoy-core::worker`; orphan cleanup verified on Windows only, tracked in issue 4 |
+| Worker supervision contract: readiness, hang detection, draining, restart policy, orphan cleanup, deferred by ADR-0002 | Implemented in `mehoy-core::worker`; orphan cleanup verified on Windows and Linux, unverified on macOS and the BSDs, tracked in issue 4 |

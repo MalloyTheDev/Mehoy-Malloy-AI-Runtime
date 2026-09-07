@@ -74,9 +74,14 @@ artifact format, one model at a time.
 
 **Known limitations**
 
-- Unix code compiles and is type-checked, but has never been executed. Only the
-  Windows paths have been run. This covers the socket transport and the parent-death
-  orphan mechanism. See the open issues.
+- The Unix code paths run on Linux and are unverified everywhere else. The socket
+  transport and the parent-death orphan mechanism are exercised there as part of
+  the default gate. macOS and the BSDs have no equivalent to the mechanism used on
+  Linux, so on those platforms a worker outliving an abruptly killed owner is a
+  real possibility rather than a theoretical one. See the open issues.
+- Real inference is verified on Windows only, because that is where the backend
+  executable on this machine runs. The runtime's own behaviour, including every
+  streaming and cancellation failure path, is verified on both platforms.
 - The protocol is not a compatibility commitment. It is expected to change.
 - The worker readiness and shutdown line protocol is provisional. It exists so
   supervision can be proven against a controllable worker; the llama.cpp backend
