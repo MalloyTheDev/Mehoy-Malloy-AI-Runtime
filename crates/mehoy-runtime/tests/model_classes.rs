@@ -17,7 +17,7 @@ use mehoy_backend_llama::{EXECUTABLE_ENV, LlamaCppBackend, ModelDescriptor};
 use mehoy_core::id::IdAllocator;
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::{ArtifactRegistry, ModelArtifact};
-use mehoy_runtime::{InstanceState, ModelCapability, ModelLoader};
+use mehoy_runtime::{InstanceState, LoadError, ModelCapability, ModelLoader};
 
 fn worker_id() -> mehoy_core::id::WorkerId {
     static IDS: std::sync::LazyLock<IdAllocator> = std::sync::LazyLock::new(IdAllocator::new);
@@ -311,6 +311,233 @@ async fn a_reloaded_generative_instance_inherits_nothing() {
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "a fresh instance inherited a verification it never demonstrated"
+    );
+    second.unload().await.expect("unloads");
+}
+
+// --------------------------------------------------------------- text generation
+
+/// A deliberately dull continuation prompt with a small budget.
+///
+/// The test proves machinery, not intelligence. Whether the model produces a good
+/// answer is a question about the model; whether the runtime can carry a request to
+/// a backend and a result back is the question here.
+fn generation_request() -> mehoy_core::inference::GenerateTextRequest {
+    use mehoy_core::inference::{GenerateTextRequest, GenerationParameters};
+    GenerateTextRequest::continuation(
+        "Complete this sentence with one word: The opposite of hot is",
+    )
+    .with_parameters(GenerationParameters {
+        max_output_tokens: Some(8),
+        temperature: Some(0.0),
+        seed: Some(42),
+        stop: Vec::new(),
+    })
+}
+
+#[tokio::test]
+async fn a_generative_model_actually_generates() {
+    use mehoy_core::inference::FinishReason;
+
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let loaded = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+
+    let result = loaded
+        .generate_text(&generation_request())
+        .await
+        .expect("the model generates");
+
+    // Machinery assertions only.
+    assert!(!result.text.is_empty(), "generation produced no content");
+    assert!(
+        matches!(
+            result.finish_reason,
+            FinishReason::Stop | FinishReason::Length
+        ),
+        "unrecognised finish reason {}",
+        result.finish_reason
+    );
+    if let Some(usage) = result.usage {
+        assert!(
+            usage.output_tokens > 0,
+            "content returned but no output tokens"
+        );
+        assert!(
+            usage.input_tokens > 0,
+            "a prompt was sent but none was counted"
+        );
+        assert!(
+            usage.output_tokens <= 8,
+            "produced {} tokens against a budget of 8",
+            usage.output_tokens
+        );
+    }
+
+    eprintln!(
+        "generated {:?} (finish: {}, usage: {:?})",
+        result.text, result.finish_reason, result.usage
+    );
+
+    loaded.unload().await.expect("unloads");
+}
+
+#[tokio::test]
+async fn generation_is_only_verified_by_generating() {
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let mut loaded = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+
+    assert!(
+        !loaded
+            .instance()
+            .capabilities()
+            .is_verified(ModelCapability::TextGeneration),
+        "loading must not verify generation"
+    );
+
+    loaded
+        .verify_text_generation(&generation_request())
+        .await
+        .expect("generates");
+
+    assert!(
+        loaded
+            .instance()
+            .capabilities()
+            .is_verified(ModelCapability::TextGeneration),
+        "a successful generation should have verified the capability"
+    );
+    eprintln!(
+        "text generation is now {}",
+        loaded
+            .instance()
+            .capabilities()
+            .state(ModelCapability::TextGeneration)
+    );
+
+    // Nothing else was verified by association. In particular a generative model
+    // does not acquire an embedding claim.
+    for other in [
+        ModelCapability::Embeddings,
+        ModelCapability::Vision,
+        ModelCapability::ToolCalling,
+        ModelCapability::StructuredOutput,
+    ] {
+        assert!(
+            !loaded.instance().capabilities().is_verified(other),
+            "{other} was verified without being demonstrated"
+        );
+    }
+
+    loaded.unload().await.expect("unloads");
+}
+
+#[tokio::test]
+async fn an_unusable_parameter_is_refused_before_reaching_a_backend() {
+    use mehoy_core::inference::{GenerateTextRequest, GenerationParameters};
+
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let loaded = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+
+    // Rejected rather than clamped: a caller who sends a negative temperature gets
+    // an error naming their mistake, not output produced from a number they never
+    // chose.
+    let request =
+        GenerateTextRequest::continuation("hello").with_parameters(GenerationParameters {
+            temperature: Some(-1.0),
+            ..GenerationParameters::default()
+        });
+    let err = loaded
+        .generate_text(&request)
+        .await
+        .expect_err("a negative temperature must be refused");
+    assert!(
+        matches!(err, LoadError::InvalidRequest { .. }),
+        "expected InvalidRequest, got {err}"
+    );
+
+    // The instance is unharmed and still serves a valid request.
+    loaded
+        .generate_text(&generation_request())
+        .await
+        .expect("a valid request still works after a refused one");
+
+    loaded.unload().await.expect("unloads");
+}
+
+#[tokio::test]
+async fn a_reloaded_instance_has_not_generated_anything() {
+    let _exclusive = exclusive().await;
+    let Some(loader) = loader() else { return };
+    let Some((registry, artifacts)) = survey() else {
+        return;
+    };
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return;
+    };
+
+    let mut first = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+    first
+        .verify_text_generation(&generation_request())
+        .await
+        .expect("generates");
+    assert!(
+        first
+            .instance()
+            .capabilities()
+            .is_verified(ModelCapability::TextGeneration)
+    );
+    first.unload().await.expect("unloads");
+
+    let second = loader
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads again");
+    assert!(
+        !second
+            .instance()
+            .capabilities()
+            .is_verified(ModelCapability::TextGeneration),
+        "a new instance inherited a generation it never performed"
     );
     second.unload().await.expect("unloads");
 }

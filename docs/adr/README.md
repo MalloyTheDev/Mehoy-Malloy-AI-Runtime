@@ -20,6 +20,7 @@ Evidence labels follow the project claim discipline used elsewhere in `docs/`:
 | [0005](0005-backend-channel-isolation-and-readiness.md) | Backend channels are private, and backend readiness is not inference | Accepted |
 | [0006](0006-general-model-runtime-not-an-llm-runtime.md) | A general model runtime, not a language-model runtime | Accepted |
 | [0007](0007-chat-is-not-the-inference-primitive.md) | Chat is an application abstraction, not the inference primitive | Accepted |
+| [0008](0008-minimal-portable-generation-parameters.md) | Only portable generation parameters are normalised | Accepted |
 
 ## Open decisions
 
@@ -33,10 +34,13 @@ Recorded here so they are not lost between records.
 | Whether the backend channel moves to a Unix socket on Unix, where the operating system enforces access | No | [0005](0005-backend-channel-isolation-and-readiness.md) |
 | How a backend is installed or distributed, as distinct from executed | No, out of scope for now | [0005](0005-backend-channel-isolation-and-readiness.md) |
 | Target hardware profile, which no document currently records | Needed before memory-aware scheduling | [research distillation](../research/runtime-landscape-distillation.md) |
+| Where the chat template renderer lives, and how its correctness is established | Yes, before the first conversation input. Raw continuation needs no template, so it does not block text generation itself | [0007](0007-chat-is-not-the-inference-primitive.md) |
+| How backend-native controls are reached without joining the portable parameter set | No, not needed to generate text | [0008](0008-minimal-portable-generation-parameters.md) |
 
 ## Resolved since being raised
 
 | Decision | Resolved by |
 | --- | --- |
 | Local client transport and its authentication model, deferred by ADR-0001 | [0004](0004-local-transport-and-surface-split.md) |
+| Which generation parameters the runtime normalises | [0008](0008-minimal-portable-generation-parameters.md) |
 | Worker supervision contract: readiness, hang detection, draining, restart policy, orphan cleanup, deferred by ADR-0002 | Implemented in `mehoy-core::worker`; orphan cleanup verified on Windows only, tracked in issue 4 |

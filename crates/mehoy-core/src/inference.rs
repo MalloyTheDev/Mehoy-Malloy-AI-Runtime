@@ -54,6 +54,8 @@ impl fmt::Display for TaskId {
 pub enum Task {
     /// Turn inputs into vectors.
     Embed,
+    /// Continue a text input.
+    GenerateText,
     /// A task named by a backend rather than by this crate.
     Custom(TaskId),
 }
@@ -62,6 +64,7 @@ impl fmt::Display for Task {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Embed => f.write_str("embed"),
+            Self::GenerateText => f.write_str("generate-text"),
             Self::Custom(id) => write!(f, "custom:{id}"),
         }
     }
@@ -262,6 +265,260 @@ pub fn validate(request: &EmbedRequest, result: &EmbeddingResult) -> Result<(), 
     Ok(())
 }
 
+// ---------------------------------------------------------------- text generation
+
+/// What a generation request is given to continue.
+///
+/// ADR-0007 makes continuation the primitive. A base completion model has no notion
+/// of roles, so a request shaped only around a conversation would make every
+/// non-conversational model a special case.
+///
+/// A conversation variant arrives when something can render one. Until then its
+/// absence is honest rather than a gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextInput {
+    /// Text to continue, exactly as the model will see it.
+    Continuation(String),
+}
+
+impl TextInput {
+    /// The text as the backend will receive it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Continuation(text) => text,
+        }
+    }
+}
+
+/// The most stop sequences a request may carry.
+pub const MAX_STOP_SEQUENCES: usize = 8;
+
+/// The most bytes any one stop sequence may be.
+pub const MAX_STOP_SEQUENCE_BYTES: usize = 256;
+
+/// Portable generation controls.
+///
+/// ADR-0008 limits this to controls whose meaning can be kept stable across
+/// backends. Engine-native controls do not belong here.
+///
+/// Every field is optional, and `None` means the runtime did not override it rather
+/// than that it equals the backend's current default. Materialising a default would
+/// freeze one engine's value into this contract and would make "whatever the backend
+/// thinks best" inexpressible.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GenerationParameters {
+    /// The most tokens to generate. Output only; this is not a context limit and
+    /// does not include the input.
+    pub max_output_tokens: Option<u32>,
+    /// Sampling temperature. Zero requests the most deterministic sampling the
+    /// backend offers.
+    pub temperature: Option<f32>,
+    /// A requested sampling seed.
+    ///
+    /// Repeatability is scoped to a backend build and its hardware. The same seed
+    /// across backends, builds, or accelerators is not promised to reproduce
+    /// anything, because quantisation, kernel selection, batching, and floating
+    /// point ordering all move the result.
+    pub seed: Option<u64>,
+    /// Sequences whose appearance ends generation.
+    pub stop: Vec<String>,
+}
+
+/// A generation parameter that cannot be honoured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidGenerationParameter {
+    /// A temperature that is negative or not a number.
+    Temperature { reason: String },
+    /// A token budget of zero, which asks for nothing.
+    MaxOutputTokens { reason: String },
+    /// Too many stop sequences, or one that is too large.
+    ///
+    /// Bounded because request content is untrusted, and an unbounded list of
+    /// unbounded patterns is a denial-of-service surface rather than a feature.
+    StopSequences { reason: String },
+}
+
+impl fmt::Display for InvalidGenerationParameter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Temperature { reason } => write!(f, "temperature is invalid: {reason}"),
+            Self::MaxOutputTokens { reason } => {
+                write!(f, "max_output_tokens is invalid: {reason}")
+            }
+            Self::StopSequences { reason } => write!(f, "stop sequences are invalid: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for InvalidGenerationParameter {}
+
+impl GenerationParameters {
+    /// Checks that every supplied parameter can be honoured.
+    ///
+    /// Invalid values are rejected rather than clamped. Silently changing a
+    /// caller's number produces output they did not ask for and cannot explain from
+    /// what they sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first parameter that cannot be honoured.
+    pub fn validate(&self) -> Result<(), InvalidGenerationParameter> {
+        if let Some(temperature) = self.temperature {
+            if !temperature.is_finite() {
+                return Err(InvalidGenerationParameter::Temperature {
+                    reason: format!("{temperature} is not a finite number"),
+                });
+            }
+            if temperature < 0.0 {
+                return Err(InvalidGenerationParameter::Temperature {
+                    reason: format!("{temperature} is negative"),
+                });
+            }
+        }
+
+        if self.max_output_tokens == Some(0) {
+            return Err(InvalidGenerationParameter::MaxOutputTokens {
+                reason: "zero asks for no output at all".to_owned(),
+            });
+        }
+
+        if self.stop.len() > MAX_STOP_SEQUENCES {
+            return Err(InvalidGenerationParameter::StopSequences {
+                reason: format!(
+                    "{} sequences exceeds the limit of {MAX_STOP_SEQUENCES}",
+                    self.stop.len()
+                ),
+            });
+        }
+        for sequence in &self.stop {
+            if sequence.is_empty() {
+                return Err(InvalidGenerationParameter::StopSequences {
+                    reason: "an empty sequence would stop generation immediately".to_owned(),
+                });
+            }
+            if sequence.len() > MAX_STOP_SEQUENCE_BYTES {
+                return Err(InvalidGenerationParameter::StopSequences {
+                    reason: format!(
+                        "a sequence of {} bytes exceeds the limit of {MAX_STOP_SEQUENCE_BYTES}",
+                        sequence.len()
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A request to continue text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerateTextRequest {
+    pub input: TextInput,
+    pub parameters: GenerationParameters,
+}
+
+impl GenerateTextRequest {
+    /// A request to continue some text with default parameters.
+    #[must_use]
+    pub fn continuation(input: impl Into<String>) -> Self {
+        Self {
+            input: TextInput::Continuation(input.into()),
+            parameters: GenerationParameters::default(),
+        }
+    }
+
+    /// Replaces the parameters.
+    #[must_use]
+    pub fn with_parameters(mut self, parameters: GenerationParameters) -> Self {
+        self.parameters = parameters;
+        self
+    }
+}
+
+/// Why generation stopped.
+///
+/// Normalised, with an escape for a reason this build does not recognise. A reason
+/// that is merely unfamiliar should not be reported as one of the known ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model finished, or a stop sequence was reached.
+    Stop,
+    /// The token budget was exhausted.
+    Length,
+    /// Something else, reported as the backend described it.
+    Other(String),
+}
+
+impl fmt::Display for FinishReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stop => f.write_str("stop"),
+            Self::Length => f.write_str("length"),
+            Self::Other(reason) => write!(f, "other:{reason}"),
+        }
+    }
+}
+
+/// Token counts, when the backend reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// The result of a completed generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerationResult {
+    pub text: String,
+    pub finish_reason: FinishReason,
+    pub usage: Option<GenerationUsage>,
+}
+
+/// Why a generation result cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationDefect {
+    /// The backend reported success but produced nothing.
+    ///
+    /// A successful status with an empty body is not demonstrated generation, and
+    /// treating it as such would let a broken backend verify a capability.
+    NoContent,
+    /// Reported counts contradict what was returned.
+    ImplausibleUsage { reason: String },
+}
+
+impl fmt::Display for GenerationDefect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoContent => f.write_str("the backend reported success but generated no content"),
+            Self::ImplausibleUsage { reason } => {
+                write!(f, "the reported token usage is not plausible: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GenerationDefect {}
+
+/// Checks that a generation result is usable.
+///
+/// # Errors
+///
+/// Returns the first defect found.
+pub fn validate_generation(result: &GenerationResult) -> Result<(), GenerationDefect> {
+    if result.text.is_empty() {
+        return Err(GenerationDefect::NoContent);
+    }
+    if let Some(usage) = result.usage
+        && usage.output_tokens == 0
+    {
+        return Err(GenerationDefect::ImplausibleUsage {
+            reason: "content was returned but no output tokens were reported".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,10 +641,143 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_or_unusable_temperature_is_rejected_not_clamped() {
+        // Clamping would produce output the caller did not ask for and cannot
+        // explain from what they sent.
+        for bad in [-0.1f32, f32::NAN, f32::INFINITY] {
+            let parameters = GenerationParameters {
+                temperature: Some(bad),
+                ..GenerationParameters::default()
+            };
+            assert!(
+                matches!(
+                    parameters.validate(),
+                    Err(InvalidGenerationParameter::Temperature { .. })
+                ),
+                "temperature {bad} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_temperature_is_allowed() {
+        let parameters = GenerationParameters {
+            temperature: Some(0.0),
+            ..GenerationParameters::default()
+        };
+        assert!(parameters.validate().is_ok());
+    }
+
+    #[test]
+    fn a_zero_token_budget_is_rejected() {
+        let parameters = GenerationParameters {
+            max_output_tokens: Some(0),
+            ..GenerationParameters::default()
+        };
+        assert!(matches!(
+            parameters.validate(),
+            Err(InvalidGenerationParameter::MaxOutputTokens { .. })
+        ));
+    }
+
+    #[test]
+    fn stop_sequences_are_bounded_because_request_content_is_untrusted() {
+        let too_many = GenerationParameters {
+            stop: (0..MAX_STOP_SEQUENCES + 1).map(|i| i.to_string()).collect(),
+            ..GenerationParameters::default()
+        };
+        assert!(matches!(
+            too_many.validate(),
+            Err(InvalidGenerationParameter::StopSequences { .. })
+        ));
+
+        let too_large = GenerationParameters {
+            stop: vec!["x".repeat(MAX_STOP_SEQUENCE_BYTES + 1)],
+            ..GenerationParameters::default()
+        };
+        assert!(matches!(
+            too_large.validate(),
+            Err(InvalidGenerationParameter::StopSequences { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_stop_sequence_is_rejected() {
+        let parameters = GenerationParameters {
+            stop: vec![String::new()],
+            ..GenerationParameters::default()
+        };
+        assert!(matches!(
+            parameters.validate(),
+            Err(InvalidGenerationParameter::StopSequences { .. })
+        ));
+    }
+
+    #[test]
+    fn unset_parameters_are_not_defaults() {
+        // The distinction ADR-0008 turns on: nothing is materialised, so the
+        // backend applies its own default and the caller can still express having
+        // no opinion.
+        let parameters = GenerationParameters::default();
+        assert_eq!(parameters.temperature, None);
+        assert_eq!(parameters.max_output_tokens, None);
+        assert_eq!(parameters.seed, None);
+        assert!(parameters.stop.is_empty());
+        assert!(parameters.validate().is_ok());
+    }
+
+    #[test]
+    fn a_successful_response_with_no_content_is_not_generation() {
+        // A broken backend returning success with an empty body must not be able to
+        // verify a capability.
+        let result = GenerationResult {
+            text: String::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        };
+        assert_eq!(
+            validate_generation(&result),
+            Err(GenerationDefect::NoContent)
+        );
+    }
+
+    #[test]
+    fn content_with_zero_reported_output_tokens_is_implausible() {
+        let result = GenerationResult {
+            text: "something".to_owned(),
+            finish_reason: FinishReason::Stop,
+            usage: Some(GenerationUsage {
+                input_tokens: 5,
+                output_tokens: 0,
+            }),
+        };
+        assert!(matches!(
+            validate_generation(&result),
+            Err(GenerationDefect::ImplausibleUsage { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unfamiliar_finish_reason_is_not_reported_as_a_known_one() {
+        let reason = FinishReason::Other("tool_call".to_owned());
+        assert_ne!(reason, FinishReason::Stop);
+        assert_ne!(reason, FinishReason::Length);
+        assert_eq!(reason.to_string(), "other:tool_call");
+    }
+
+    #[test]
+    fn continuation_is_the_only_input_shape_so_far() {
+        // ADR-0007: a conversation variant arrives when something can render one.
+        let input = TextInput::Continuation("Once upon a time".to_owned());
+        assert_eq!(input.as_str(), "Once upon a time");
+    }
+
+    #[test]
     fn only_implemented_tasks_have_their_own_variant() {
         // Guards the rule rather than the list. A variant added without an
         // implementation behind it is a promise the runtime does not keep, so a
         // future task should arrive with its implementation or as Custom.
         assert_eq!(Task::Embed.to_string(), "embed");
+        assert_eq!(Task::GenerateText.to_string(), "generate-text");
     }
 }

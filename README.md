@@ -42,11 +42,14 @@ get right before anything else is built on top of it.
 - Loading a text-generative model through the same call, transaction, and capability
   rules as an embedding model, with the backend choosing its own launch mode from
   the artifact's metadata
+- Text generation from a raw continuation, with a deliberately small portable
+  parameter set, verified the same way embeddings are: by performing one
 
 **Not implemented**
 
-- Performing text generation. A generative model loads and is reachable; no
-  generation has been requested, so no token streaming or cancellation either
+- Streaming and cancellation. A generation returns one complete result
+- Conversation input. Continuation is the primitive; a conversation shape arrives
+  when something can render a template for it
 - Any model class beyond text embeddings and text generation. Nothing prevents them;
   nothing implements them yet
 - Taking ownership of an artifact into a managed store. Registration records where

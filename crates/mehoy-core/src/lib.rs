@@ -17,6 +17,9 @@ pub mod worker;
 
 pub use event::{ExitCause, InferenceEvent, RuntimeEvent};
 pub use id::{IdAllocator, ModelId, RequestId, WorkerId};
-pub use inference::{EmbedRequest, Embedding, EmbeddingResult, Task, TaskId};
+pub use inference::{
+    EmbedRequest, Embedding, EmbeddingResult, FinishReason, GenerateTextRequest,
+    GenerationParameters, GenerationResult, GenerationUsage, Task, TaskId, TextInput,
+};
 pub use transport::{ClientStream, Endpoint, EndpointAddress, EndpointError, Stream};
 pub use worker::{ProcessWorker, WorkerHandle, WorkerSpec, WorkerState};

@@ -21,12 +21,14 @@
 pub mod channel;
 pub mod compatibility;
 pub mod embed;
+pub mod generate;
 pub mod health;
 pub mod identity;
 
 pub use channel::{BackendChannel, ChannelSecret, SecretFile};
 pub use compatibility::{Compatibility, LaunchMode, ModelDescriptor};
 pub use embed::{EmbedError, embed};
+pub use generate::{GenerateError, generate};
 pub use health::{CredentialState, Readiness, StartupPhase};
 pub use identity::{BackendFamily, BackendIdentity};
 

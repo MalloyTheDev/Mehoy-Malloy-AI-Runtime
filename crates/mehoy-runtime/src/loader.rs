@@ -24,7 +24,9 @@ use mehoy_backend_llama::{
     BackendError, LlamaCppBackend, LlamaCppWorkerSpec, ModelDescriptor, RunningBackend,
 };
 use mehoy_core::id::WorkerId;
-use mehoy_core::inference::{self, EmbedRequest, EmbeddingResult};
+use mehoy_core::inference::{
+    self, EmbedRequest, EmbeddingResult, GenerateTextRequest, GenerationResult,
+};
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::{ArtifactId, ArtifactRegistry, ArtifactState, ModelArtifact, RegistryError};
 
@@ -55,6 +57,11 @@ pub enum LoadError {
     Instance { reason: String },
     /// The instance is not in a state that can serve requests.
     NotUsable { state: String },
+    /// The request itself cannot be honoured.
+    ///
+    /// Refused before anything reaches a backend, so an unusable parameter reads as
+    /// a caller error rather than as an engine failure.
+    InvalidRequest { detail: String },
     /// The backend refused or could not serve the request.
     ///
     /// Carries the backend's own account rather than flattening it, so an
@@ -90,6 +97,9 @@ impl fmt::Display for LoadError {
             }
             Self::NotUsable { state } => {
                 write!(f, "the instance cannot serve requests while it is {state}")
+            }
+            Self::InvalidRequest { detail } => {
+                write!(f, "the request cannot be honoured: {detail}")
             }
             Self::Inference { detail } => write!(f, "{detail}"),
             Self::UnusableResult { detail } => {
@@ -195,6 +205,72 @@ impl LoadedModel {
         self.instance
             .capabilities_mut()
             .verify(ModelCapability::Embeddings, backend);
+        Ok(result)
+    }
+
+    /// Continues text using this instance.
+    ///
+    /// Parameters are validated before anything is sent, so an unusable value is a
+    /// clear refusal rather than a backend error, and the result is validated before
+    /// it is returned: a successful status carrying no content is not generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::NotUsable`] when the instance is not ready,
+    /// [`LoadError::InvalidRequest`] when a parameter cannot be honoured,
+    /// [`LoadError::Inference`] when the backend refuses, and
+    /// [`LoadError::UnusableResult`] when the response is not usable.
+    pub async fn generate_text(
+        &self,
+        request: &GenerateTextRequest,
+    ) -> Result<GenerationResult, LoadError> {
+        if !self.instance.state().is_usable() {
+            return Err(LoadError::NotUsable {
+                state: self.instance.state().to_string(),
+            });
+        }
+
+        request
+            .parameters
+            .validate()
+            .map_err(|invalid| LoadError::InvalidRequest {
+                detail: invalid.to_string(),
+            })?;
+
+        let result = mehoy_backend_llama::generate(self.backend.channel(), request)
+            .await
+            .map_err(|source| LoadError::Inference {
+                detail: source.to_string(),
+            })?;
+
+        inference::validate_generation(&result).map_err(|defect| LoadError::UnusableResult {
+            detail: defect.to_string(),
+        })?;
+
+        Ok(result)
+    }
+
+    /// Generates text and, if it succeeds, records that this backend demonstrated
+    /// the capability.
+    ///
+    /// The only route by which [`ModelCapability::TextGeneration`] becomes verified,
+    /// mirroring embeddings exactly. A successful status is not enough: the result
+    /// must actually carry content, so a backend returning an empty success cannot
+    /// verify anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`LoadedModel::generate_text`] returns. The capability is
+    /// unchanged on failure, because a refusal is not evidence of absence.
+    pub async fn verify_text_generation(
+        &mut self,
+        request: &GenerateTextRequest,
+    ) -> Result<GenerationResult, LoadError> {
+        let result = self.generate_text(request).await?;
+        let backend = self.backend.identity().cloned();
+        self.instance
+            .capabilities_mut()
+            .verify(ModelCapability::TextGeneration, backend);
         Ok(result)
     }
 
