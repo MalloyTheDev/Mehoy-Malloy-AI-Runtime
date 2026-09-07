@@ -25,11 +25,16 @@ get right before anything else is built on top of it.
 - A llama.cpp backend that locates and identifies an executable, starts it under
   supervision on a private loopback channel behind a per-worker secret, maps its
   health endpoint to a readiness state, and captures its output for diagnostics
+- A GGUF reader and a durable artifact registry. Containers are inspected by the
+  runtime itself rather than by a backend, validated as untrusted input, and
+  recorded without being copied or moved
 
 **Not implemented**
 
-- Model import, registry, or loading
-- Inference of any kind, and therefore no token streaming or cancellation
+- Loading a registered artifact into a backend, and therefore no inference, token
+  streaming, or cancellation
+- Taking ownership of an artifact into a managed store. Registration records where
+  a file is; it never copies or moves it
 - Backend installation or download. The executable is configured explicitly
 - Memory-aware scheduling
 - Any vendor-compatible endpoint
@@ -86,6 +91,14 @@ invalid, and `3` when no daemon is listening.
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets && cargo test --workspace
+```
+
+The Unix code paths are additionally type-checked from Windows. The registry crate is
+excluded because its bundled SQLite needs a Linux C compiler, and it contains no
+platform-specific code, so nothing is lost:
+
+```bash
+cargo clippy --workspace --exclude mehoy-registry --all-targets --target x86_64-unknown-linux-gnu
 ```
 
 `cargo test --workspace` builds the example binaries the supervision tests execute,
