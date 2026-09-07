@@ -37,6 +37,15 @@ This includes:
 Do the work directly in the current session. If a task appears large enough to warrant
 delegation, say so and wait for an explicit instruction.
 
+## Plugins and skills
+
+The installed custom plugins and skills are part of this repository's engineering
+environment. Use relevant ones proactively for substantial work rather than recreating
+equivalent workflows manually. Select them deliberately based on the task, verify their
+conclusions against repository evidence and authoritative sources, and never invoke
+plugins merely to create activity. Important findings discovered through a plugin must be
+fixed in scope or recorded according to the repository's issue discipline.
+
 ## Git Identity
 
 All commits must use:
