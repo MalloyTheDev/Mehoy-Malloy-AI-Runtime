@@ -9,11 +9,12 @@ See [ADR-0006](docs/adr/0006-general-model-runtime-not-an-llm-runtime.md).
 
 ## Status
 
-Early. There is no inference yet.
+Early, and it performs real inference.
 
-What exists is the runtime skeleton: a daemon that listens on a per-user local
-endpoint, a client that talks to it, and the security properties that endpoint has to
-get right before anything else is built on top of it.
+One complete lifecycle works end to end: a GGUF container is registered, loaded onto
+a supervised backend, asked to embed or to generate, streamed incrementally,
+cancelled by identity, and unloaded so that nothing survives it. One backend, one
+artifact format, one model at a time.
 
 **Implemented**
 
@@ -47,10 +48,12 @@ get right before anything else is built on top of it.
 - Incremental delivery of a generation as runtime-native events, with the engine's
   event framing and wire format confined to the backend adapter, and bounded
   buffering so a slow consumer slows the backend rather than this process
-
 - Cancelling a request by identity, independently of who is reading its output,
   with an idle budget that shares the same stopping machinery while reporting its
   own distinct cause
+- Unloading an instance: admission closes first, outstanding requests are stopped
+  through that same machinery, they are given a bounded time to settle, and only
+  then is the worker taken away
 
 **Not implemented**
 

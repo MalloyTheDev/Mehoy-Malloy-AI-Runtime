@@ -41,5 +41,9 @@ required-features = ["real-backend-tests"]
 name = "cancellation"
 required-features = ["real-backend-tests"]
 
+[[test]]
+name = "unload"
+required-features = ["real-backend-tests"]
+
 [lints]
 workspace = true

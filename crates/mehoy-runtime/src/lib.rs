@@ -24,7 +24,8 @@ pub mod loader;
 pub use capability::{CapabilityEvidence, CapabilityState, ModelCapabilities, ModelCapability};
 pub use instance::{InstanceFailure, InstanceId, InstanceState, ModelInstance};
 pub use loader::{
-    CancelError, CancelOutcome, GenerationRequest, LoadError, LoadedModel, ModelLoader,
+    CancelError, CancelOutcome, GenerationRequest, LifecyclePhase, LoadError, LoadedModel,
+    ModelLoader, UnloadOutcome,
 };
 
 #[cfg(feature = "fault-injection")]

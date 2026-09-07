@@ -55,7 +55,13 @@ pub struct InstanceFailure {
     pub reason: String,
 }
 
-/// Where an instance is in its life.
+/// How an instance's bringing-up went.
+///
+/// Describes whether the backend came up and loaded the artifact. It deliberately
+/// does not describe whether the runtime is still willing to serve requests on the
+/// instance, which is [`crate::LifecyclePhase`] and is decided under the lock that
+/// admits requests. Keeping those separate means there is one authority for
+/// admission rather than two that can disagree.
 ///
 /// `Failed` is terminal with no edge back into `Starting`, matching the worker
 /// state machine. Recovering from a failure is an explicit act, not something the
@@ -169,10 +175,6 @@ impl ModelInstance {
     /// Mutable capabilities, for a probe that demonstrates one.
     pub fn capabilities_mut(&mut self) -> &mut ModelCapabilities {
         &mut self.capabilities
-    }
-
-    pub(crate) fn set_state(&mut self, next: InstanceState) {
-        self.state = next;
     }
 
     /// Forces a state, for tests that need to reach one the happy path does not

@@ -21,10 +21,12 @@
 use std::fmt;
 
 use mehoy_backend_llama::{
-    BackendError, LlamaCppBackend, LlamaCppWorkerSpec, ModelDescriptor, RunningBackend,
+    BackendChannel, BackendError, BackendIdentity, LlamaCppBackend, LlamaCppWorkerSpec,
+    ModelDescriptor, RunningBackend,
 };
 use mehoy_core::cancel::{
     CancellationCause, CancellationStrategy, RequestBudget, RequestHandle, RequestState,
+    UnloadBudget,
 };
 use mehoy_core::id::{IdAllocator, RequestId, WorkerId};
 use mehoy_core::inference::{
@@ -190,22 +192,126 @@ impl fmt::Display for CancelError {
 
 impl std::error::Error for CancelError {}
 
+/// Waits for every handle to reach a terminal state, returning how many did not.
+///
+/// Polled rather than awaited on a signal because the handles come from anywhere
+/// and a request may end through a path this function knows nothing about. The
+/// interval is short relative to any sensible drain budget.
+async fn drain(handles: &[RequestHandle], budget: std::time::Duration) -> usize {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let unsettled = handles
+            .iter()
+            .filter(|handle| !handle.is_terminal())
+            .count();
+        if unsettled == 0 {
+            return 0;
+        }
+        if std::time::Instant::now() >= deadline {
+            return unsettled;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// A running instance together with the backend serving it.
 #[derive(Debug)]
 pub struct LoadedModel {
     instance: ModelInstance,
-    backend: RunningBackend,
+    /// Where to reach the backend.
+    ///
+    /// Held separately from the worker so that starting a request never has to
+    /// take the lifecycle lock for longer than the admission decision itself.
+    channel: BackendChannel,
+    identity: Option<BackendIdentity>,
     /// Identifies each inference request this instance serves.
     ///
     /// Owned here because nothing above the loader allocates one yet. When a
     /// request pipeline exists, identity will arrive with the request instead.
     requests: IdAllocator,
-    /// Every request this instance has accepted and not yet seen end.
+    /// Admission, in-flight work, and the worker, under one lock.
     ///
-    /// The runtime holds these so a request can be stopped by identity, without
-    /// needing to know who is reading its output or whether anyone still is.
-    /// ADR-0009 records why that ownership sits here rather than in the stream.
-    active: std::sync::Mutex<std::collections::HashMap<RequestId, RequestHandle>>,
+    /// One lock rather than three because the decision that matters is atomic:
+    /// whether this instance is still admitting work, and if so registering the
+    /// request, must happen together. Checking and then registering separately
+    /// admits the classic race in which a request is accepted moments after the
+    /// instance stopped accepting any.
+    lifecycle: std::sync::Mutex<Lifecycle>,
+}
+
+/// Everything an instance's lifetime turns on.
+#[derive(Debug)]
+struct Lifecycle {
+    phase: LifecyclePhase,
+    active: std::collections::HashMap<RequestId, RequestHandle>,
+    /// Taken out when unloading begins, so a second attempt finds it gone.
+    worker: Option<RunningBackend>,
+}
+
+/// Whether an instance is still serving.
+///
+/// Distinct from [`InstanceState`], which describes whether the backend came up.
+/// This describes whether the runtime is still willing to put work on it, and it
+/// is the authority for that decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    /// Accepting requests.
+    Serving,
+    /// Not accepting requests; existing ones are being stopped.
+    Unloading,
+    /// The worker is gone and its resources are released.
+    Unloaded,
+    /// Teardown did not complete, so what remains is unknown.
+    ///
+    /// Deliberately not reported as unloaded. Something may still be running, and
+    /// saying otherwise would be the more dangerous of the two wrong answers.
+    UnloadFailed,
+}
+
+impl fmt::Display for LifecyclePhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Serving => "serving",
+            Self::Unloading => "unloading",
+            Self::Unloaded => "unloaded",
+            Self::UnloadFailed => "failed to unload",
+        })
+    }
+}
+
+/// What unloading did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnloadOutcome {
+    /// Every outstanding request settled before the worker was stopped.
+    Drained { cancelled: usize },
+    /// The drain budget expired, so teardown went ahead anyway.
+    ///
+    /// Not a failure. Terminating the worker is what ends the work for certain,
+    /// and it is the reason the budget can be allowed to expire at all.
+    Escalated { cancelled: usize, unsettled: usize },
+    /// Another unload was already in progress.
+    AlreadyUnloading,
+    /// This instance had already been unloaded.
+    AlreadyUnloaded,
+}
+
+impl fmt::Display for UnloadOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Drained { cancelled } => {
+                write!(f, "unloaded after {cancelled} request(s) settled")
+            }
+            Self::Escalated {
+                cancelled,
+                unsettled,
+            } => write!(
+                f,
+                "unloaded with {unsettled} of {cancelled} request(s) still unsettled"
+            ),
+            Self::AlreadyUnloading => f.write_str("an unload was already in progress"),
+            Self::AlreadyUnloaded => f.write_str("the instance was already unloaded"),
+        }
+    }
 }
 
 impl LoadedModel {
@@ -220,8 +326,14 @@ impl LoadedModel {
 
     /// The private channel to the backend serving this model.
     #[must_use]
-    pub fn backend(&self) -> &RunningBackend {
-        &self.backend
+    pub const fn channel(&self) -> &BackendChannel {
+        &self.channel
+    }
+
+    /// Whether this instance is still serving, being torn down, or gone.
+    #[must_use]
+    pub fn phase(&self) -> LifecyclePhase {
+        self.lifecycle().phase
     }
 
     /// Performs an embedding request against this instance.
@@ -244,7 +356,7 @@ impl LoadedModel {
             });
         }
 
-        let result = mehoy_backend_llama::embed(self.backend.channel(), request)
+        let result = mehoy_backend_llama::embed(&self.channel, request)
             .await
             .map_err(|source| LoadError::Inference {
                 detail: source.to_string(),
@@ -274,7 +386,7 @@ impl LoadedModel {
         request: &EmbedRequest,
     ) -> Result<EmbeddingResult, LoadError> {
         let result = self.embed(request).await?;
-        let backend = self.backend.identity().cloned();
+        let backend = self.identity.clone();
         self.instance
             .capabilities_mut()
             .verify(ModelCapability::Embeddings, backend);
@@ -310,7 +422,7 @@ impl LoadedModel {
                 detail: invalid.to_string(),
             })?;
 
-        let result = mehoy_backend_llama::generate(self.backend.channel(), request)
+        let result = mehoy_backend_llama::generate(&self.channel, request)
             .await
             .map_err(|source| LoadError::Inference {
                 detail: source.to_string(),
@@ -340,7 +452,7 @@ impl LoadedModel {
         request: &GenerateTextRequest,
     ) -> Result<GenerationResult, LoadError> {
         let result = self.generate_text(request).await?;
-        let backend = self.backend.identity().cloned();
+        let backend = self.identity.clone();
         self.instance
             .capabilities_mut()
             .verify(ModelCapability::TextGeneration, backend);
@@ -398,12 +510,26 @@ impl LoadedModel {
                 detail: invalid.to_string(),
             })?;
 
-        let handle = RequestHandle::new(self.requests.request());
+        // The admission decision and the registration are one operation. Doing
+        // them separately is how a request gets accepted just after the instance
+        // stopped accepting any, with both halves looking individually correct.
+        let handle = {
+            let mut lifecycle = self.lifecycle();
+            if lifecycle.phase != LifecyclePhase::Serving {
+                return Err(LoadError::NotUsable {
+                    state: lifecycle.phase.to_string(),
+                });
+            }
+            lifecycle
+                .active
+                .retain(|_, existing| !existing.is_terminal());
+            let handle = RequestHandle::new(self.requests.request());
+            lifecycle.active.insert(handle.id(), handle.clone());
+            handle
+        };
         let request_id = handle.id();
-        self.register(handle.clone());
 
-        let stream =
-            mehoy_backend_llama::start_generation(self.backend.channel(), request, handle, budget);
+        let stream = mehoy_backend_llama::start_generation(&self.channel, request, handle, budget);
 
         Ok(GenerationRequest { request_id, stream })
     }
@@ -426,9 +552,9 @@ impl LoadedModel {
     /// A request that has already ended is not an error; it is reported as such.
     pub fn cancel(&self, request_id: RequestId) -> Result<CancelOutcome, CancelError> {
         let handle = {
-            let mut active = self.active();
-            active.retain(|_, handle| !handle.is_terminal());
-            active.get(&request_id).cloned()
+            let mut lifecycle = self.lifecycle();
+            lifecycle.active.retain(|_, handle| !handle.is_terminal());
+            lifecycle.active.get(&request_id).cloned()
         };
 
         let Some(handle) = handle else {
@@ -462,15 +588,18 @@ impl LoadedModel {
     /// so this is a live count and not a total.
     #[must_use]
     pub fn active_requests(&self) -> usize {
-        let mut active = self.active();
-        active.retain(|_, handle| !handle.is_terminal());
-        active.len()
+        let mut lifecycle = self.lifecycle();
+        lifecycle.active.retain(|_, handle| !handle.is_terminal());
+        lifecycle.active.len()
     }
 
     /// The state of one request, if this instance still knows about it.
     #[must_use]
     pub fn request_state(&self, request_id: RequestId) -> Option<RequestState> {
-        self.active().get(&request_id).map(RequestHandle::state)
+        self.lifecycle()
+            .active
+            .get(&request_id)
+            .map(RequestHandle::state)
     }
 
     /// How this instance's backend is able to stop work.
@@ -479,17 +608,11 @@ impl LoadedModel {
         mehoy_backend_llama::cancellation_strategy()
     }
 
-    fn register(&self, handle: RequestHandle) {
-        let mut active = self.active();
-        active.retain(|_, existing| !existing.is_terminal());
-        active.insert(handle.id(), handle);
-    }
-
-    fn active(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<RequestId, RequestHandle>> {
-        // Never held across an await, so a panic cannot poison it in practice.
-        self.active
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, Lifecycle> {
+        // Never held across an await. Every slow step of unloading happens with
+        // this released, which is what keeps teardown from blocking every other
+        // caller for the length of a drain deadline.
+        self.lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -514,7 +637,7 @@ impl LoadedModel {
         if !stream.demonstrated_generation() {
             return false;
         }
-        let backend = self.backend.identity().cloned();
+        let backend = self.identity.clone();
         self.instance
             .capabilities_mut()
             .verify(ModelCapability::TextGeneration, backend);
@@ -527,10 +650,80 @@ impl LoadedModel {
     ///
     /// Returns an error when the backend had to be killed rather than stopping
     /// politely. The backend is stopped either way.
-    pub async fn unload(mut self) -> Result<(), LoadError> {
-        self.instance
-            .set_state(crate::instance::InstanceState::Stopping);
-        self.backend.stop().await.map_err(LoadError::Backend)
+    pub async fn unload(&self) -> Result<UnloadOutcome, LoadError> {
+        self.unload_within(UnloadBudget::default()).await
+    }
+
+    /// The same, with an explicit drain budget.
+    ///
+    /// # Errors
+    ///
+    /// As [`LoadedModel::unload`].
+    pub async fn unload_within(&self, budget: UnloadBudget) -> Result<UnloadOutcome, LoadError> {
+        // Phase one, holding the lock: close admission and take ownership of what
+        // has to be cleaned up. Nothing slow happens here.
+        let (mut worker, outstanding) = {
+            let mut lifecycle = self.lifecycle();
+            match lifecycle.phase {
+                LifecyclePhase::Unloading => return Ok(UnloadOutcome::AlreadyUnloading),
+                LifecyclePhase::Unloaded => return Ok(UnloadOutcome::AlreadyUnloaded),
+                LifecyclePhase::UnloadFailed | LifecyclePhase::Serving => {}
+            }
+            lifecycle.phase = LifecyclePhase::Unloading;
+            let outstanding: Vec<RequestHandle> = lifecycle
+                .active
+                .values()
+                .filter(|handle| !handle.is_terminal())
+                .cloned()
+                .collect();
+            (lifecycle.worker.take(), outstanding)
+        };
+
+        let Some(worker) = worker.take() else {
+            // Admission was closed by a previous attempt that then failed. There
+            // is no worker left to stop, so finish the bookkeeping.
+            self.finish(LifecyclePhase::Unloaded);
+            return Ok(UnloadOutcome::AlreadyUnloaded);
+        };
+
+        // Phase two, with the lock released: stopping requests, waiting for them,
+        // and stopping a process are all slow, and none of them may block another
+        // caller for the length of a drain deadline.
+        let cancelled = outstanding.len();
+        for handle in &outstanding {
+            // Through the same mechanism as any other cancellation, so a request
+            // has one way to end rather than two that could disagree.
+            handle.request_cancellation(CancellationCause::InstanceUnloading);
+        }
+        let unsettled = drain(&outstanding, budget.drain).await;
+
+        let mut worker = worker;
+        let stopped = worker.stop().await;
+
+        // Phase three: record what happened.
+        let phase = if stopped.is_ok() {
+            LifecyclePhase::Unloaded
+        } else {
+            LifecyclePhase::UnloadFailed
+        };
+        self.finish(phase);
+        stopped.map_err(LoadError::Backend)?;
+
+        Ok(if unsettled == 0 {
+            UnloadOutcome::Drained { cancelled }
+        } else {
+            UnloadOutcome::Escalated {
+                cancelled,
+                unsettled,
+            }
+        })
+    }
+
+    fn finish(&self, phase: LifecyclePhase) {
+        let mut lifecycle = self.lifecycle();
+        lifecycle.phase = phase;
+        // Requests do not outlive the instance that was serving them.
+        lifecycle.active.clear();
     }
 }
 
@@ -660,9 +853,14 @@ impl ModelLoader {
 
         Ok(LoadedModel {
             instance,
-            backend,
+            channel: backend.channel().clone(),
+            identity: backend.identity().cloned(),
             requests: IdAllocator::default(),
-            active: std::sync::Mutex::default(),
+            lifecycle: std::sync::Mutex::new(Lifecycle {
+                phase: LifecyclePhase::Serving,
+                active: std::collections::HashMap::new(),
+                worker: Some(backend),
+            }),
         })
     }
 }

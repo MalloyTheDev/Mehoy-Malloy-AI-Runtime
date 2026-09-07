@@ -37,6 +37,13 @@ pub enum CancellationCause {
     /// Recorded rather than left implicit so that a failed channel send is not
     /// what decides a public semantic.
     ConsumerGone,
+    /// The instance serving the request is being unloaded.
+    ///
+    /// Unloading does not end requests by its own separate mechanism. It stops
+    /// them the same way anything else does, so there is one way for a request to
+    /// end rather than two that could disagree, and this cause is what preserves
+    /// why it happened.
+    InstanceUnloading,
 }
 
 impl fmt::Display for CancellationCause {
@@ -45,6 +52,7 @@ impl fmt::Display for CancellationCause {
             Self::User => f.write_str("cancelled"),
             Self::StreamIdleTimeout => f.write_str("idle for longer than allowed"),
             Self::ConsumerGone => f.write_str("nothing was reading the output"),
+            Self::InstanceUnloading => f.write_str("the model was being unloaded"),
         }
     }
 }
@@ -81,6 +89,40 @@ impl Default for RequestBudget {
     fn default() -> Self {
         Self {
             stream_idle: Self::DEFAULT_STREAM_IDLE,
+        }
+    }
+}
+
+/// How long unloading waits for work to settle before it stops waiting.
+///
+/// Deliberately not the same value, or the same field, as a request's idle
+/// allowance. That one asks whether a single request is still alive; this one asks
+/// how long an instance being torn down should let its outstanding work finish
+/// first. Sharing one duration between them would mean tuning one and silently
+/// changing the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnloadBudget {
+    /// How long active requests are given to reach a terminal state.
+    ///
+    /// Expiring is not a claim that the backend is still working, nor that it has
+    /// stopped. It means the instance stopped waiting and escalated to terminating
+    /// the worker, which is the one thing that does end the work for certain.
+    pub drain: Duration,
+}
+
+impl UnloadBudget {
+    /// The default drain allowance.
+    ///
+    /// Long enough for a request already producing output to notice and stop,
+    /// short enough that unloading is not held hostage by a backend that has
+    /// decided to finish reading a very large prompt first.
+    pub const DEFAULT_DRAIN: Duration = Duration::from_secs(10);
+}
+
+impl Default for UnloadBudget {
+    fn default() -> Self {
+        Self {
+            drain: Self::DEFAULT_DRAIN,
         }
     }
 }
