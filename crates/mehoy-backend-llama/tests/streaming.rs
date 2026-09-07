@@ -877,25 +877,38 @@ async fn a_backend_that_dies_while_cancelling_still_reports_a_cancellation() {
 }
 
 #[tokio::test]
-async fn dropping_the_stream_is_not_a_cancellation() {
-    // ADR-0009: a consumer that stops reading has not asked for the work to stop.
-    // The request must not silently report itself cancelled because a value went
-    // out of scope.
-    let (handle, stream) = open_cancellable(Script::Silent, RequestBudget::default()).await;
+async fn dropping_a_stream_ends_the_request_with_its_own_cause() {
+    // ADR-0009: a consumer that stops reading has not asked for the work to stop,
+    // so this must not be reported as somebody cancelling. It does end the
+    // request, because there is nowhere for the output to go, and the cause says
+    // exactly that rather than borrowing one of the other two.
+    let (handle, mut stream) = open_cancellable(
+        Script::ChunksThenSilence(vec![event("some", None), event("more", None)]),
+        RequestBudget::default(),
+    )
+    .await;
 
+    // Take one delta so the execution task is past its first send, then leave.
+    while let Some(Ok(event)) = stream.next().await {
+        if matches!(event, GenerationEvent::TextDelta { .. }) {
+            break;
+        }
+    }
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    assert_eq!(
-        handle.cancellation_cause(),
-        None,
-        "dropping a stream must not record a cancellation cause"
-    );
-    assert_ne!(
-        handle.state(),
-        mehoy_core::cancel::RequestState::Cancelled,
-        "dropping a stream must not mark the request cancelled"
-    );
+    for _ in 0..100 {
+        if handle.is_terminal() {
+            assert_eq!(
+                handle.cancellation_cause(),
+                Some(CancellationCause::ConsumerGone),
+                "an abandoned request must not be reported as a user cancellation"
+            );
+            assert_ne!(handle.cancellation_cause(), Some(CancellationCause::User));
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("an abandoned request never reached a terminal state, so it leaked");
 }
 
 #[tokio::test]

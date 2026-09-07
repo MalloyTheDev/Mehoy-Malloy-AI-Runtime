@@ -13,6 +13,12 @@ authors.workspace = true
 # the rollback path can actually be exercised rather than assumed.
 fault-injection = []
 
+# Opt-in. Builds the test targets that need a real backend executable and a
+# multi-gigabyte model on disk. Excluded from the default gate because they are
+# not portable, not deterministic, and slow: what they verify is the behaviour of
+# a particular engine build rather than of this code.
+real-backend-tests = []
+
 [dependencies]
 mehoy-backend-llama = { path = "../mehoy-backend-llama", version = "0.1.0" }
 mehoy-core.workspace = true
@@ -26,6 +32,14 @@ tokio = { workspace = true, features = ["macros", "rt", "time"] }
 mehoy-runtime = { path = ".", features = ["fault-injection"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+
+[[test]]
+name = "model_classes"
+required-features = ["real-backend-tests"]
+
+[[test]]
+name = "cancellation"
+required-features = ["real-backend-tests"]
 
 [lints]
 workspace = true

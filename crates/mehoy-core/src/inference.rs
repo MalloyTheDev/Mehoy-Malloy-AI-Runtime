@@ -703,6 +703,16 @@ impl GenerationSink {
         &self.handle
     }
 
+    /// Resolves when nothing is reading this stream any more.
+    ///
+    /// Needed because a producer otherwise only discovers an absent consumer when
+    /// it next sends, and a backend that has gone quiet may not send again for a
+    /// long time. Without this, abandoning a stream would leave the request
+    /// looking alive until its idle budget expired.
+    pub async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
     /// Emits generated text.
     ///
     /// Empty text is dropped rather than forwarded. Backends routinely send events
@@ -750,6 +760,10 @@ impl GenerationSink {
             return;
         }
         self.finished = true;
+        // Records the reason before the outcome, so a request that ended because
+        // its consumer went away does not present as one with no reason at all.
+        // A cause already set, by a caller or by an expired budget, wins.
+        self.handle.request_cancellation(cause);
         self.handle.finish(RequestState::Cancelled);
         let event = GenerationEvent::Cancelled {
             request_id: self.handle.id(),

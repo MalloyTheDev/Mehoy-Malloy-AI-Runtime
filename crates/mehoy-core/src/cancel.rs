@@ -27,6 +27,16 @@ pub enum CancellationCause {
     User,
     /// The backend stopped producing output for longer than the request allowed.
     StreamIdleTimeout,
+    /// Nothing is reading the output any more.
+    ///
+    /// Distinct from [`CancellationCause::User`] on purpose. Nobody asked for this
+    /// request to stop; the only thing that could observe it went away, and with a
+    /// backend stopped by closing its transport there is no way to keep the work
+    /// running that does not also hold a connection open to discard the answer.
+    ///
+    /// Recorded rather than left implicit so that a failed channel send is not
+    /// what decides a public semantic.
+    ConsumerGone,
 }
 
 impl fmt::Display for CancellationCause {
@@ -34,6 +44,7 @@ impl fmt::Display for CancellationCause {
         match self {
             Self::User => f.write_str("cancelled"),
             Self::StreamIdleTimeout => f.write_str("idle for longer than allowed"),
+            Self::ConsumerGone => f.write_str("nothing was reading the output"),
         }
     }
 }

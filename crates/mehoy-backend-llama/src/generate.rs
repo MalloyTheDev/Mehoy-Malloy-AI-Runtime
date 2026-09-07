@@ -535,6 +535,12 @@ async fn read(
         let waited = tokio::select! {
             biased;
             cause = cancel.cancelled() => break 'body Err(Interruption::Cancelled(cause)),
+            // Noticed here rather than only when the next send fails, because a
+            // backend that has gone quiet might not give us another send for
+            // minutes, and the request would look alive that whole time.
+            () = sink.closed() => {
+                break 'body Err(Interruption::Cancelled(CancellationCause::ConsumerGone));
+            }
             frame = tokio::time::timeout(budget.stream_idle, body.frame()) => frame,
         };
 
@@ -604,8 +610,11 @@ async fn read(
             }
 
             if !sink.delta(choice.text).await {
-                pump.abort();
-                return;
+                // Nothing is reading any more. Returning here without recording an
+                // outcome would leave the request looking alive forever while its
+                // connection closed underneath, so the runtime would report a
+                // request as running that the backend had already stopped.
+                break 'body Err(Interruption::Cancelled(CancellationCause::ConsumerGone));
             }
         }
     };

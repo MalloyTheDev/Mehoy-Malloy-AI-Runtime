@@ -1,11 +1,12 @@
 //! What this engine build actually does when a generation is abandoned.
 //!
 //! These tests answer a question rather than guarding a behaviour, and they are
-//! ignored by default because each one loads a multi-gigabyte model and then
-//! deliberately waits. Run them explicitly:
+//! excluded from the default gate: each one loads a multi-gigabyte model and then
+//! deliberately waits. The target is not built without its feature, so this file
+//! costs the ordinary gate nothing. Run it explicitly:
 //!
 //! ```text
-//! cargo test -p mehoy-backend-llama --test cancellation_characterisation -- --ignored --nocapture --test-threads=1
+//! cargo test -p mehoy-backend-llama --features real-backend-tests \n//!     --test cancellation_characterisation -- --nocapture
 //! ```
 //!
 //! # Why this exists before any cancellation is implemented
@@ -89,6 +90,17 @@ fn generative_container() -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// Serialises these tests.
+///
+/// Each one loads a multi-gigabyte model onto the accelerator. Running them
+/// concurrently, which is what the test harness does by default, means several
+/// resident copies competing for the same memory, and the failure that produces
+/// says nothing about cancellation.
+async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 /// Starts a generation and hands back the handle that can stop it.
@@ -252,8 +264,8 @@ async fn read_until_first_delta(stream: &mut GenerationStream) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn what_routes_this_build_exposes() {
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -275,10 +287,10 @@ async fn what_routes_this_build_exposes() {
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn a_completed_generation_frees_its_slot() {
     // The control. Without this, an idle slot after cancellation proves nothing,
     // because it might simply be what this endpoint always reports.
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -310,10 +322,10 @@ async fn a_completed_generation_frees_its_slot() {
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn dropping_the_stream_may_not_stop_the_work() {
     // The question M1.15 turns on. If this reports that the slot stays busy, then
     // the runtime cannot honestly call a dropped stream a cancellation.
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -350,10 +362,10 @@ async fn dropping_the_stream_may_not_stop_the_work() {
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn cutting_the_connection_abruptly_may_not_stop_the_work() {
     // A harsher version of the same question: not a polite drop through hyper, but
     // the socket disappearing, which is what a crashed client looks like.
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -406,12 +418,12 @@ Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn how_long_the_long_request_runs_when_nobody_interrupts_it() {
     // Without this, the interruption experiments prove nothing. If the long
     // request happens to finish in a couple of hundred milliseconds, then a slot
     // going idle shortly after a disconnect is ordinary completion wearing the
     // costume of cancellation.
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -472,9 +484,9 @@ fn long_prompt_request() -> GenerateTextRequest {
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn how_long_a_long_prompt_takes_before_its_first_token() {
     // Establishes that there is a prefill window worth cancelling inside.
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -493,12 +505,12 @@ async fn how_long_a_long_prompt_takes_before_its_first_token() {
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn cancelling_during_prefill() {
     // The engine does not begin its response until it has read the prompt, so
     // during this window there is no response to abandon. The request exists
     // regardless, which is the whole point of owning requests rather than
     // streams, and cancelling it is the only stop available here.
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -593,8 +605,8 @@ async fn post_json(channel: &BackendChannel, path: &str, body: String) -> (Statu
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn diagnose_the_long_prompt() {
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };
@@ -685,11 +697,11 @@ fn medium_prompt_generative_request(marker: &str) -> GenerateTextRequest {
 }
 
 #[tokio::test]
-#[ignore = "loads a multi-gigabyte model and deliberately waits"]
 async fn how_late_a_prefill_cancellation_is_actually_honoured() {
     // Bounds the worst case. If cancelling during prefill costs the whole request
     // rather than the rest of prefill, then a cancelled request holds its slot for
     // as long as an uncancelled one and cancellation buys nothing here.
+    let _exclusive = exclusive().await;
     let Some(backend) = running_backend().await else {
         return;
     };

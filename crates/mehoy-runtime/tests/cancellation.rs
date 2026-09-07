@@ -204,10 +204,11 @@ async fn cancelling_a_finished_request_reports_that_it_finished() {
 }
 
 #[tokio::test]
-async fn dropping_a_stream_does_not_cancel_its_request() {
-    // ADR-0009. If a destructor meant cancellation, an ordinary refactor could
-    // stop inference, and a request whose stream nobody holds could never be
-    // stopped deliberately.
+async fn dropping_a_stream_is_not_reported_as_a_user_cancellation() {
+    // ADR-0009. If a destructor meant the same thing as asking to cancel, an
+    // ordinary refactor could look like a deliberate stop in the record. The
+    // request does end, because nothing can receive its output, and it says so in
+    // its own terms.
     let _exclusive = exclusive().await;
     let Some(loaded) = loaded().await else { return };
 
@@ -216,12 +217,25 @@ async fn dropping_a_stream_does_not_cancel_its_request() {
         .expect("the request is accepted");
     let request_id = started.request_id;
     drop(started.stream);
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    assert_ne!(
-        loaded.request_state(request_id),
-        Some(RequestState::Cancelled),
-        "dropping a stream reported a cancellation nobody asked for"
+    let mut ended = false;
+    for _ in 0..100 {
+        match loaded.request_state(request_id) {
+            Some(state) if state.is_terminal() => {
+                ended = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert!(
+        ended,
+        "an abandoned request never ended, so the runtime would count it forever"
+    );
+    assert_eq!(
+        loaded.active_requests(),
+        0,
+        "an abandoned request is still being tracked"
     );
 
     loaded.unload().await.expect("unloads");

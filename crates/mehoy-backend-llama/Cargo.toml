@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Opt-in. Builds the test targets that need a real backend executable and a
+# multi-gigabyte model on disk. Excluded from the default gate because they are
+# not portable, not deterministic, and slow: what they verify is the behaviour of
+# a particular engine build rather than of this code.
+real-backend-tests = []
+
 [dependencies]
 mehoy-core.workspace = true
 
@@ -20,11 +27,15 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Used only by the orphan test, to check whether a process still exists.
 libc.workspace = true
+
+[[test]]
+name = "cancellation_characterisation"
+required-features = ["real-backend-tests"]
 
 [lints]
 workspace = true

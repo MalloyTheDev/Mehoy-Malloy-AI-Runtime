@@ -88,6 +88,21 @@ callers happen to structure their code.
 Abandoned work must still be bounded, but that is a separate obligation met by a
 request budget, not by redefining what a drop means.
 
+A dropped stream does still end the request, and that is stated rather than left
+to fall out of the implementation. With a backend stopped by closing its
+transport, keeping the work alive would mean holding a connection open purely to
+discard the answer, occupying a slot nobody is waiting on. So the request ends,
+and it ends with its own cause: nothing was reading it. That is not the same
+statement as somebody having cancelled it, and a consumer can tell the two apart.
+
+The alternative worth naming is detaching, where the work continues without an
+observer and can later be reattached to. That needs a backend able to stop one
+request without closing a shared transport, and somewhere for the output to go in
+the meantime. Neither exists, so neither is pretended.
+
+What is deliberately avoided either way is a channel send failing and thereby
+deciding what cancellation means.
+
 ### 4. Cancellation has a requested phase and a stopped phase
 
 Cancelling is not instantaneous, and pretending otherwise would misreport it. On

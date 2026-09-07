@@ -136,11 +136,42 @@ cargo clippy --workspace --exclude mehoy-registry --all-targets --target x86_64-
 so it is sufficient on its own. Running a single test target with `--test` does not
 build them.
 
-Tests that need a real llama.cpp backend are skipped unless one is configured, and
-say so when they skip:
+### Two gates
+
+The default gate and the real-backend gate answer different questions, and only the
+first is expected to pass on every machine and every commit.
+
+| | Default gate | Real-backend gate |
+| --- | --- | --- |
+| Command | `cargo test --workspace` | see below |
+| Needs a backend executable | no | yes |
+| Needs a multi-gigabyte model | no | yes |
+| Deterministic | yes | no, it measures a running engine |
+| Portable | yes | no, results are specific to one build |
+| Runtime | seconds | minutes |
+| Expected on every commit | yes | no |
+
+The default gate covers this runtime's own behaviour, including every failure path
+of streaming and cancellation, against servers that misbehave on request. Nothing
+in it loads a model.
+
+The real-backend gate covers what a particular engine build actually does: that a
+model loads and generates, and that stopping a request stops the work rather than
+merely stopping the output. Those are properties of that engine rather than of this
+code, which is why they are opt-in. The test targets are not built without their
+feature, so they cost the default gate nothing.
 
 ```bash
-MEHOY_LLAMA_SERVER=/path/to/llama-server cargo test --workspace
+MEHOY_LLAMA_SERVER=/path/to/llama-server cargo test --workspace \
+    --features mehoy-backend-llama/real-backend-tests,mehoy-runtime/real-backend-tests
+```
+
+Those tests still skip, and say so, when the executable or a suitable model is
+absent. Run the cancellation characterisation on its own to see what it measured:
+
+```bash
+MEHOY_LLAMA_SERVER=/path/to/llama-server cargo test -p mehoy-backend-llama \
+    --features real-backend-tests --test cancellation_characterisation -- --nocapture
 ```
 
 To trace endpoint lifecycle transitions, including raw operating system errors:
