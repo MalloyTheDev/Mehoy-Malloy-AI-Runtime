@@ -72,7 +72,7 @@ recorded below.
 | E12 | Serving systems are measured with TTFT, inter-token latency, time per output token, queue latency, and KV-cache utilization | S1 | `[VERIFIED]` | These are the standard metrics. Instrumenting them early is cheap; retrofitting them is not |
 | E13 | Ollama's local API requires no authentication by default | S1 | `[UNVERIFIED]` | Cited as a posture to deliberately diverge from. Worth confirming before repeating the claim publicly |
 | R1 | The repository is public and has no LICENSE file | S2 | `[OBSERVED]` | Without a license, the default is exclusive copyright. Outside contribution and downstream use are legally blocked despite the repository being visible |
-| R2 | Both existing commits are authored under a name that does not match the identity required by CLAUDE.md, and both are already pushed | S2 | `[OBSERVED]` | Correcting published history requires a force push, which project rules prohibit without explicit authorization |
+| R2 | Both existing commits are authored under a name that does not match the identity required by the project's working rules, and both are already pushed | S2 | `[OBSERVED]` | Correcting published history requires a force push, which project rules prohibit without explicit authorization |
 | R3 | The repository contains no source tree, no build configuration, and no committed language choice | S2 | `[OBSERVED]` | Every implementation decision below is still fully open and cheap to make |
 
 ## Alternatives and tradeoffs
