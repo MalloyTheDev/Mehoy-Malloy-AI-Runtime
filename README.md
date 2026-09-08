@@ -133,12 +133,23 @@ invalid, and `3` when no daemon is listening.
 cargo fmt --all --check && cargo clippy --workspace --all-targets && cargo test --workspace
 ```
 
-The Unix code paths are additionally type-checked from Windows. The registry crate is
-excluded because its bundled SQLite needs a Linux C compiler, and it contains no
-platform-specific code, so nothing is lost:
+The Unix code paths are additionally type-checked from Windows. The crates named
+are the ones holding platform-specific code; the rest are omitted because the
+registry's bundled SQLite needs a Linux C compiler and everything depending on it
+would pull that in:
 
 ```bash
-cargo clippy --workspace --exclude mehoy-registry --all-targets --target x86_64-unknown-linux-gnu
+cargo clippy -p mehoy-core -p mehoy-backend-llama -p mehoy-protocol --all-targets --target x86_64-unknown-linux-gnu
+```
+
+This is a compile check, not a substitute for running the suite on Linux.
+
+Dependencies are checked for known advisories and for licence and source policy.
+The policy lives in `deny.toml`; without it the licence check has an empty
+allow-list, so it rejects everything and reports nothing useful:
+
+```bash
+cargo audit && cargo deny check
 ```
 
 `cargo test --workspace` builds the example binaries the supervision tests execute,

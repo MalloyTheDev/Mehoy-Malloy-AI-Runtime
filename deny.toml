@@ -1,0 +1,43 @@
+# Dependency policy, enforced by cargo-deny.
+#
+# Without this file cargo-deny's license allow-list is empty, so it rejects every
+# dependency including the ones under this project's own licence. The check runs,
+# always fails, and therefore tells nobody anything. This makes it mean something.
+
+[advisories]
+# Fail on any dependency with a known advisory. Exceptions belong here, with a
+# reason, rather than being silenced globally.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive only. Every entry below is a licence actually present in the tree at
+# the time of writing, so an addition is a deliberate act rather than a default.
+#
+# Copyleft is deliberately absent, including LGPL. One dependency, r-efi, offers
+# LGPL-2.1-or-later as one branch of a triple licence alongside MIT and Apache-2.0;
+# omitting it here is what makes the permissive branch the one that is taken, and
+# what makes the check fail loudly if that ever stops being an option.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Nothing is banned outright yet. A crate belongs here when there is a specific
+# reason to refuse it, not as a speculative list.
+deny = []
+
+[sources]
+# Dependencies come from crates.io. A git or path dependency on a third party is
+# something to notice rather than something to allow quietly.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

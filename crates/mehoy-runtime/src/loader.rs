@@ -833,7 +833,16 @@ impl ModelLoader {
             Ok(loaded) => Ok(loaded),
             Err(rollback) => {
                 let (reason, mut backend) = *rollback;
-                let _ = backend.stop().await;
+                // A rollback that could not stop the worker has left one running,
+                // holding accelerator memory, and the caller is the only party in a
+                // position to do anything about it. Reporting only that the instance
+                // could not be built would describe the smaller half of what happened.
+                let reason = match backend.stop().await {
+                    Ok(()) => reason,
+                    Err(err) => format!(
+                        "{reason}; the backend could not be stopped afterwards and may still                          be running: {err}"
+                    ),
+                };
                 Err(LoadError::Instance { reason })
             }
         }

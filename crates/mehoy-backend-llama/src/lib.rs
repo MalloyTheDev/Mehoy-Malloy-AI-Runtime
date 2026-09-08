@@ -44,6 +44,18 @@ use mehoy_core::worker::{
     WorkerSpec,
 };
 
+/// Describes a worker that could not be stopped during a failed startup.
+///
+/// Empty when the shutdown succeeded, so the ordinary message is unchanged. A
+/// startup that fails is expected to leave nothing behind, and the one case where
+/// it does is worth saying out loud rather than discarding with the error that
+/// caused it.
+fn describe_leak(failure: Option<&WorkerError>) -> String {
+    failure.map_or_else(String::new, |err| {
+        format!("; the worker could not be stopped and may still be running: {err}")
+    })
+}
+
 /// Environment variable naming the backend executable.
 pub const EXECUTABLE_ENV: &str = "MEHOY_LLAMA_SERVER";
 
@@ -52,7 +64,14 @@ pub const EXECUTABLE_ENV: &str = "MEHOY_LLAMA_SERVER";
 /// The system temporary directory is per-user on the platforms targeted here, and
 /// the file itself is created owner-only regardless.
 fn secret_directory() -> PathBuf {
-    std::env::temp_dir().join("mehoy-backend")
+    // Qualified by user, matching the endpoint directory in `mehoy-core`. A name
+    // shared between accounts is a directory the first account to create it owns,
+    // and on a shared temporary directory that account need not be this one.
+    #[cfg(unix)]
+    let name = format!("mehoy-backend-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let name = String::from("mehoy-backend");
+    std::env::temp_dir().join(name)
 }
 
 /// How many layers to place on an accelerator.
@@ -384,18 +403,20 @@ impl LlamaCppBackend {
                         readiness: Readiness::BackendReady,
                     }),
                     Ok(CredentialState::Refused { status }) => {
-                        let _ = ProcessWorker.shutdown(&mut handle).await;
+                        let left_running = ProcessWorker.shutdown(&mut handle).await.err();
                         Err(BackendError::Rejected {
                             detail: format!(
-                                "the backend refused the runtime's own credential with status                                  {status}; it is serving but unusable"
+                                "the backend refused the runtime's own credential with status                                  {status}; it is serving but unusable{}",
+                                describe_leak(left_running.as_ref())
                             ),
                         })
                     }
                     Err(err) => {
-                        let _ = ProcessWorker.shutdown(&mut handle).await;
+                        let left_running = ProcessWorker.shutdown(&mut handle).await.err();
                         Err(BackendError::Rejected {
                             detail: format!(
-                                "cannot confirm the backend accepts its credential: {err}"
+                                "cannot confirm the backend accepts its credential: {err}{}",
+                                describe_leak(left_running.as_ref())
                             ),
                         })
                     }

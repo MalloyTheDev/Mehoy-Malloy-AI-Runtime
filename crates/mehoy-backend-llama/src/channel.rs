@@ -84,6 +84,56 @@ pub struct SecretFile {
     path: PathBuf,
 }
 
+/// Creates the credential directory, or refuses one that is not ours alone.
+///
+/// The endpoint transport in `mehoy-core` already does this for its socket
+/// directory, and the credential directory needs it for the same reason: a
+/// directory an attacker owns lets them delete or replace the key file between
+/// its being written and the backend reading it, which is enough to make model
+/// loading fail on demand or to make the backend enforce a key of their choosing.
+///
+/// The mode is applied by `mkdir` itself rather than afterwards, so there is no
+/// interval in which the directory exists and is world-writable.
+fn ensure_private_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+        match std::fs::symlink_metadata(dir) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir),
+            Err(err) => Err(err),
+            Ok(meta) => {
+                let refuse = |reason: &str| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{} is not usable for credentials: {reason}", dir.display()),
+                    ))
+                };
+                if meta.file_type().is_symlink() {
+                    return refuse("it is a symbolic link");
+                }
+                if !meta.is_dir() {
+                    return refuse("it is not a directory");
+                }
+                if meta.uid() != unsafe { libc::geteuid() } {
+                    return refuse("it belongs to another user");
+                }
+                if meta.mode() & 0o077 != 0 {
+                    return refuse("it is accessible to other users");
+                }
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 impl SecretFile {
     /// Writes a secret to a file only its owner can read.
     ///
@@ -94,7 +144,7 @@ impl SecretFile {
     ///
     /// Returns an error when the file cannot be created or written.
     pub fn create(directory: &Path, secret: &ChannelSecret) -> io::Result<Self> {
-        std::fs::create_dir_all(directory)?;
+        ensure_private_directory(directory)?;
 
         // Named per file rather than per process. A runtime supervises several
         // backends at once, so a per-process name would have them overwrite each
@@ -107,7 +157,9 @@ impl SecretFile {
         let path = directory.join(format!("backend-{}-{suffix}.key", std::process::id()));
 
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        // `create_new` rather than `create`: the name carries eight random bytes,
+        // so an existing file at that path is not a collision to overwrite.
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -212,6 +264,82 @@ impl BackendChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory path nothing else is using.
+    fn scratch(label: &str) -> PathBuf {
+        let mut unique = [0u8; 8];
+        getrandom::fill(&mut unique).expect("randomness");
+        let suffix: String = unique.iter().map(|byte| format!("{byte:02x}")).collect();
+        std::env::temp_dir().join(format!("mehoy-test-{label}-{suffix}"))
+    }
+
+    #[test]
+    fn a_credential_directory_is_created_private() {
+        let dir = scratch("private");
+        let secret = ChannelSecret::generate().expect("a secret");
+        let file = SecretFile::create(&dir, &secret).expect("creates");
+
+        assert!(file.path().exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir)
+                .expect("readable")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "the credential directory is reachable by other users"
+            );
+            let file_mode = std::fs::metadata(file.path())
+                .expect("readable")
+                .permissions()
+                .mode();
+            assert_eq!(file_mode & 0o777, 0o600, "the credential is not owner-only");
+        }
+
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_directory_open_to_others_is_refused() {
+        // A directory another account can write to lets them delete or replace the
+        // key between it being written and the backend reading it, which is enough
+        // to make loading fail on demand or to substitute a key of their choosing.
+        use std::os::unix::fs::DirBuilderExt;
+
+        let dir = scratch("open");
+        std::fs::DirBuilder::new()
+            .mode(0o777)
+            .create(&dir)
+            .expect("creates the permissive directory");
+
+        let secret = ChannelSecret::generate().expect("a secret");
+        let err = SecretFile::create(&dir, &secret)
+            .expect_err("a world-writable directory must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_directory_that_is_a_symlink_is_refused() {
+        let target = scratch("symlink-target");
+        let link = scratch("symlink");
+        std::fs::create_dir_all(&target).expect("creates the target");
+        std::os::unix::fs::symlink(&target, &link).expect("creates the link");
+
+        let secret = ChannelSecret::generate().expect("a secret");
+        let err = SecretFile::create(&link, &secret).expect_err("a symlink must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&target);
+    }
 
     #[test]
     fn a_reserved_channel_is_loopback_with_a_nonzero_port() {

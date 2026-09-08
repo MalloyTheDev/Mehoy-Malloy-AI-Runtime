@@ -567,13 +567,35 @@ impl ProcessWorker {
 
     /// Kills the worker without asking.
     async fn terminate(&self, handle: &mut WorkerHandle) -> Result<(), WorkerError> {
+        let mut refused = None;
         if let Some(child) = handle.child.as_mut() {
-            let _ = child.start_kill();
+            // A worker that has already exited needs no killing, and signalling one
+            // that has also been reaped fails. Asking first keeps that ordinary case
+            // from being reported as a refusal to stop.
+            let already_gone = matches!(child.try_wait(), Ok(Some(_)));
+            if !already_gone {
+                // Otherwise the outcome is reported. Discarding it lets a worker
+                // that could not be killed be described as stopped, which is the
+                // more dangerous of the two wrong answers: the caller believes the
+                // accelerator has been released.
+                if let Err(err) = child.start_kill() {
+                    // It may simply have exited in the interval. That is not a
+                    // failure to stop it, so the claim is checked before it is made.
+                    if !matches!(child.try_wait(), Ok(Some(_))) {
+                        refused = Some(err);
+                    }
+                }
+            }
+            // The wait is never reported. Losing a race to reap a process that has
+            // already exited is ordinary, and says nothing about whether it is gone.
             let _ = child.wait().await;
             handle.child = None;
         }
         handle.flush_output().await;
-        Ok(())
+        match refused {
+            Some(err) => Err(WorkerError::Io(err)),
+            None => Ok(()),
+        }
     }
 }
 

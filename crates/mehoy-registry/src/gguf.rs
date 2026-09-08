@@ -55,6 +55,19 @@ const MAX_HEADER_BYTES: u64 = 64 << 20;
 /// vocabulary does not become several hundred thousand owned strings in memory.
 const MAX_RETAINED_ARRAY_LEN: usize = 64;
 
+/// How deeply arrays may nest.
+///
+/// An array element may itself be an array, so reading one is recursive, and the
+/// byte budget does not bound that recursion: each level costs only the twelve
+/// bytes of an element type and a length, so the header budget alone permits
+/// millions of levels and exhausts the stack long before it. A stack overflow is
+/// a fault rather than a catchable panic, so it takes the whole process with it.
+///
+/// No real container nests arrays at all. The limit is deliberately larger than
+/// zero anyway, so an unusual but honest file is refused with an error rather
+/// than treated as malformed by a rule this parser invented.
+const MAX_ARRAY_DEPTH: u32 = 4;
+
 /// A typed GGUF metadata value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
@@ -316,7 +329,11 @@ impl<R: Read> Budgeted<R> {
     }
 }
 
-fn read_value<R: Read>(reader: &mut Budgeted<R>, type_id: u32) -> Result<MetadataValue, GgufError> {
+fn read_value<R: Read>(
+    reader: &mut Budgeted<R>,
+    type_id: u32,
+    depth: u32,
+) -> Result<MetadataValue, GgufError> {
     Ok(match type_id {
         0 => MetadataValue::U8(reader.u8("uint8")?),
         1 => MetadataValue::I8(reader.u8("int8")? as i8),
@@ -327,7 +344,7 @@ fn read_value<R: Read>(reader: &mut Budgeted<R>, type_id: u32) -> Result<Metadat
         6 => MetadataValue::F32(f32::from_bits(reader.u32("float32")?)),
         7 => MetadataValue::Bool(reader.u8("bool")? != 0),
         8 => MetadataValue::String(reader.string("string")?),
-        9 => return read_array(reader),
+        9 => return read_array(reader, depth),
         10 => MetadataValue::U64(reader.u64("uint64")?),
         11 => MetadataValue::I64(reader.u64("int64")? as i64),
         12 => MetadataValue::F64(f64::from_bits(reader.u64("float64")?)),
@@ -335,7 +352,14 @@ fn read_value<R: Read>(reader: &mut Budgeted<R>, type_id: u32) -> Result<Metadat
     })
 }
 
-fn read_array<R: Read>(reader: &mut Budgeted<R>) -> Result<MetadataValue, GgufError> {
+fn read_array<R: Read>(reader: &mut Budgeted<R>, depth: u32) -> Result<MetadataValue, GgufError> {
+    if depth >= MAX_ARRAY_DEPTH {
+        return Err(GgufError::Implausible {
+            what: "array nesting depth",
+            value: u64::from(depth) + 1,
+            limit: u64::from(MAX_ARRAY_DEPTH),
+        });
+    }
     let element_type = reader.u32("array element type")?;
     let len = reader.u64("array length")?;
     if len > MAX_ARRAY_LEN {
@@ -352,7 +376,7 @@ fn read_array<R: Read>(reader: &mut Budgeted<R>) -> Result<MetadataValue, GgufEr
     let retain = usize::try_from(len).unwrap_or(usize::MAX) <= MAX_RETAINED_ARRAY_LEN;
     let mut retained = Vec::new();
     for _ in 0..len {
-        let value = read_value(reader, element_type)?;
+        let value = read_value(reader, element_type, depth + 1)?;
         if retain {
             retained.push(value);
         }
@@ -410,7 +434,7 @@ pub fn parse<R: Read>(source: R) -> Result<GgufHeader, GgufError> {
     for _ in 0..metadata_count {
         let key = reader.string("metadata key")?;
         let type_id = reader.u32("metadata value type")?;
-        let value = read_value(&mut reader, type_id)?;
+        let value = read_value(&mut reader, type_id, 0)?;
         metadata.insert(key, value);
     }
 
@@ -518,6 +542,39 @@ mod tests {
     fn version_two_is_accepted() {
         let bytes = Builder::new().magic().u32(2).u64(0).u64(0).build();
         assert_eq!(parse(bytes.as_slice()).expect("parses").version, 2);
+    }
+
+    #[test]
+    fn deeply_nested_arrays_are_refused_rather_than_exhausting_the_stack() {
+        // An array element may itself be an array, so reading one recurses. Each
+        // level costs only twelve bytes on the wire, so the byte budget alone
+        // permits millions of levels: it bounds the file, not the stack. A stack
+        // overflow is a fault rather than a panic, so it would take the whole
+        // process down rather than failing this one registration.
+        let mut builder = Builder::new()
+            .magic()
+            .u32(3)
+            .u64(0)
+            .u64(1)
+            .string("nested")
+            .u32(9);
+        for _ in 0..64 {
+            // element type 9 (array), length 1: one more level, every time.
+            builder = builder.u32(9).u64(1);
+        }
+        let bytes = builder.u32(4).u64(0).build();
+
+        let err = parse(bytes.as_slice()).expect_err("nesting must be refused");
+        assert!(
+            matches!(
+                err,
+                GgufError::Implausible {
+                    what: "array nesting depth",
+                    ..
+                }
+            ),
+            "expected a nesting refusal, got {err}"
+        );
     }
 
     #[test]

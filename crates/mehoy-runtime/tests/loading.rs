@@ -116,21 +116,32 @@ fn smallest_real_container() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn backend_process_count() -> usize {
-    std::process::Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq llama-server.exe", "/NH", "/FO", "CSV"])
+    // Scoped to this process's own children. Counting every backend on the
+    // machine makes the result depend on whatever the other test binaries happen
+    // to be doing, since cargo runs them in parallel and several of them start
+    // real backends. That produced a test that failed for reasons having nothing
+    // to do with what it was checking.
+    let script = format!(
+        "(Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" |          Where-Object {{ $_.ParentProcessId -eq {} }} | Measure-Object).Count",
+        std::process::id()
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_or(0, |out| {
             String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|line| line.contains("llama-server"))
-                .count()
+                .trim()
+                .parse()
+                .unwrap_or(0)
         })
 }
 
 #[cfg(unix)]
 fn backend_process_count() -> usize {
+    // Scoped to this process's own children, for the reason given on the Windows
+    // counterpart above.
     std::process::Command::new("pgrep")
-        .args(["-c", "llama-server"])
+        .args(["-c", "-P", &std::process::id().to_string(), "llama-server"])
         .output()
         .map_or(0, |out| {
             String::from_utf8_lossy(&out.stdout)
@@ -381,6 +392,15 @@ async fn a_registered_artifact_loads_and_yields_one_instance() {
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .unwrap_or_else(|err| panic!("{} did not load: {err}", container.display()));
+
+    // The leak detector has to be able to detect. A counter that always answered
+    // zero would make every "nothing was left running" assertion in this file pass
+    // without checking anything, and nothing else here would notice.
+    assert!(
+        backend_process_count() > before,
+        "the backend process counter cannot see a backend that is running, so the \
+         assertions built on it prove nothing"
+    );
 
     let instance = loaded.instance();
     assert_eq!(instance.state(), &InstanceState::BackendReady);

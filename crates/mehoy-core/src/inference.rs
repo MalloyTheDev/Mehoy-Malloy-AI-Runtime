@@ -785,6 +785,21 @@ impl GenerationSink {
     }
 }
 
+impl Drop for GenerationSink {
+    /// Records a failure for a request whose producer vanished.
+    ///
+    /// Reachable when the task driving a generation is dropped or panics, which
+    /// ends the request without any of the terminal methods running. The stream
+    /// notices the closed channel and reports it, but only if somebody is still
+    /// reading; a request whose consumer had also gone would otherwise stay
+    /// registered as live for the rest of the instance's life.
+    fn drop(&mut self) {
+        if !self.finished {
+            self.handle.finish(RequestState::Failed);
+        }
+    }
+}
+
 /// The consuming half of a generation stream.
 ///
 /// Yields [`GenerationEvent::Started`], then zero or more

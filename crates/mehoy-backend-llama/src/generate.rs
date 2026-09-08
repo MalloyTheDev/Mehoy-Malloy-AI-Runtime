@@ -380,7 +380,8 @@ pub fn start_generation(
     stream
 }
 
-/// Runs `work` unless cancellation arrives first or the budget runs out.
+/// Runs `work` unless the request is stopped, its consumer leaves, or the budget
+/// runs out.
 ///
 /// Biased towards cancellation, so a request cancelled before its work has made
 /// progress stops deterministically rather than depending on which future the
@@ -394,6 +395,7 @@ pub fn start_generation(
 /// would hang forever.
 async fn within<F>(
     cancel: &CancellationToken,
+    sink: &GenerationSink,
     budget: Duration,
     work: F,
 ) -> Result<F::Output, CancellationCause>
@@ -403,6 +405,12 @@ where
     tokio::select! {
         biased;
         cause = cancel.cancelled() => Err(cause),
+        // Watched here and not only once the response has begun. On a backend
+        // that reads a large input before answering, everything up to the first
+        // response header is the longest phase of the request, and a consumer
+        // that leaves during it would otherwise go unnoticed until the idle
+        // budget expired tens of seconds later.
+        () = sink.closed() => Err(CancellationCause::ConsumerGone),
         outcome = tokio::time::timeout(budget, work) => match outcome {
             Ok(value) => Ok(value),
             Err(_) => {
@@ -429,7 +437,13 @@ async fn execute(job: Job, sink: GenerationSink, cancel: CancellationToken, budg
 
     // A connection per request, never pooled, because closing it is how this
     // backend is told to stop.
-    let transport = match within(&cancel, budget.stream_idle, TcpStream::connect(job.address)).await
+    let transport = match within(
+        &cancel,
+        &sink,
+        budget.stream_idle,
+        TcpStream::connect(job.address),
+    )
+    .await
     {
         Err(cause) => return sink.cancel(cause).await,
         Ok(Err(err)) => {
@@ -443,7 +457,8 @@ async fn execute(job: Job, sink: GenerationSink, cancel: CancellationToken, budg
     };
 
     let handshake = hyper::client::conn::http1::handshake(TokioIo::new(transport));
-    let (mut sender, connection) = match within(&cancel, budget.stream_idle, handshake).await {
+    let (mut sender, connection) = match within(&cancel, &sink, budget.stream_idle, handshake).await
+    {
         Err(cause) => return sink.cancel(cause).await,
         Ok(Err(err)) => {
             return sink
@@ -480,7 +495,14 @@ async fn execute(job: Job, sink: GenerationSink, cancel: CancellationToken, budg
 
     // The long wait. For a large prompt the backend reads all of it before
     // answering, so this is where a cancellation most often lands.
-    let response = match within(&cancel, budget.stream_idle, sender.send_request(request)).await {
+    let response = match within(
+        &cancel,
+        &sink,
+        budget.stream_idle,
+        sender.send_request(request),
+    )
+    .await
+    {
         Err(cause) => {
             pump.abort();
             return sink.cancel(cause).await;
@@ -499,7 +521,13 @@ async fn execute(job: Job, sink: GenerationSink, cancel: CancellationToken, budg
 
     let status = response.status();
     if !status.is_success() {
-        let collected = within(&cancel, budget.stream_idle, response.into_body().collect()).await;
+        let collected = within(
+            &cancel,
+            &sink,
+            budget.stream_idle,
+            response.into_body().collect(),
+        )
+        .await;
         pump.abort();
         return match collected {
             Err(cause) => sink.cancel(cause).await,

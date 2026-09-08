@@ -17,6 +17,13 @@
 //! hints are parsed as fields and discarded, because nothing in this runtime uses
 //! them.
 
+/// The most that may be held while an event is still incomplete.
+///
+/// A backend that opens a data line and never terminates it would otherwise grow
+/// this buffer without limit, and the request's idle budget would never fire
+/// because bytes keep arriving. Generous enough that no real event approaches it.
+const MAX_PENDING_BYTES: usize = 8 << 20;
+
 /// Accumulates bytes and yields the payload of each complete event.
 #[derive(Debug, Default)]
 pub(crate) struct SseDecoder {
@@ -39,6 +46,12 @@ impl SseDecoder {
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
+
+        if self.buffer.len() > MAX_PENDING_BYTES || self.data.len() > MAX_PENDING_BYTES {
+            return Err(format!(
+                "a single event exceeded {MAX_PENDING_BYTES} bytes without ending"
+            ));
+        }
 
         while let Some(line) = self.take_line()? {
             if let Some(event) = self.consume(&line)? {

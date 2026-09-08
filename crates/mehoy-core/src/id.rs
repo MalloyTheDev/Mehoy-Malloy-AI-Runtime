@@ -56,9 +56,20 @@ opaque_id!(
 ///
 /// Identifiers are unique within one daemon process. They are not stable across
 /// restarts and must not be persisted or treated as durable references.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct IdAllocator {
     next: AtomicU64,
+}
+
+impl Default for IdAllocator {
+    /// Deferred to [`IdAllocator::new`] rather than derived.
+    ///
+    /// A derived `Default` zeroes the counter, which hands out the identifier
+    /// that `new` exists to skip, and does it silently at whichever call site
+    /// happened to use `default()`.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IdAllocator {
