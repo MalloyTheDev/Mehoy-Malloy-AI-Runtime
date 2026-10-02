@@ -13,7 +13,7 @@ use std::fmt;
 use mehoy_backend_llama::BackendIdentity;
 use mehoy_registry::ArtifactId;
 
-use crate::capability::ModelCapabilities;
+use crate::capability::{ModelCapabilities, ModelCapability};
 
 /// An instance's identifier.
 ///
@@ -113,13 +113,36 @@ impl fmt::Display for InstanceState {
 }
 
 /// A model resident in a backend.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ModelInstance {
     id: InstanceId,
     artifact_id: ArtifactId,
     backend: Option<BackendIdentity>,
     state: InstanceState,
-    capabilities: ModelCapabilities,
+    /// The only part of an instance that changes after it is built.
+    ///
+    /// Everything else is settled by the time the instance exists, so this is the
+    /// one thing needing interior mutability. Keeping it to a single leaf lock is
+    /// what lets an instance be shared without the runtime handing out a mutable
+    /// reference to it, and the lock is never held while anything else is.
+    capabilities: std::sync::Mutex<ModelCapabilities>,
+}
+
+impl Clone for ModelInstance {
+    /// Clones to a snapshot.
+    ///
+    /// The copy shares nothing with the original: a later verification on one is
+    /// not visible through the other. That is the point, since a snapshot handed
+    /// to a caller describes what was known when it was taken.
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            backend: self.backend.clone(),
+            state: self.state.clone(),
+            capabilities: std::sync::Mutex::new(self.capabilities()),
+        }
+    }
 }
 
 impl ModelInstance {
@@ -135,7 +158,7 @@ impl ModelInstance {
             artifact_id,
             backend,
             state: InstanceState::BackendReady,
-            capabilities,
+            capabilities: std::sync::Mutex::new(capabilities),
         }
     }
 
@@ -164,23 +187,29 @@ impl ModelInstance {
     }
 
     /// What is known about this model's capabilities, and how strongly.
-    #[must_use]
-    pub fn capabilities(&self) -> &ModelCapabilities {
-        &self.capabilities
-    }
-
-    /// Mutable capabilities, for a probe that demonstrates one.
-    pub fn capabilities_mut(&mut self) -> &mut ModelCapabilities {
-        &mut self.capabilities
-    }
-
-    /// Forces a state, for tests that need to reach one the happy path does not
-    /// pass through.
     ///
-    /// Deliberately named so a production call site would look wrong.
-    #[doc(hidden)]
-    pub fn set_state_for_test(&mut self, next: InstanceState) {
-        self.state = next;
+    /// A copy rather than a borrow, so reading it never holds a lock that a
+    /// concurrent verification would need.
+    #[must_use]
+    pub fn capabilities(&self) -> ModelCapabilities {
+        self.read().clone()
+    }
+
+    /// Records that this instance demonstrated a capability.
+    ///
+    /// Takes a shared reference because an instance is shared: the runtime owns
+    /// it and several callers may hold it at once. Demonstrating a capability is
+    /// the only thing that changes an instance after it is built.
+    pub(crate) fn verify(&self, capability: ModelCapability, backend: Option<BackendIdentity>) {
+        self.read().verify(capability, backend);
+    }
+
+    fn read(&self) -> std::sync::MutexGuard<'_, ModelCapabilities> {
+        // Nothing awaits or calls out while this is held, so poisoning cannot
+        // happen in practice and recovering the value is the useful response.
+        self.capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

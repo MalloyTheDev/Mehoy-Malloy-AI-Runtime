@@ -18,7 +18,7 @@ use mehoy_core::id::IdAllocator;
 use mehoy_core::inference::EmbedRequest;
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::ArtifactRegistry;
-use mehoy_runtime::{LoadError, LoadedModel, ModelCapability, ModelLoader};
+use mehoy_runtime::{InstanceId, ModelCapability, Runtime, RuntimeError};
 
 /// The model card requires a task prefix; without one the vectors are not what the
 /// model was trained to produce.
@@ -71,8 +71,8 @@ fn embedding_container() -> Option<PathBuf> {
 /// Loads an embedding model, or explains why the test is skipped.
 async fn with_embedding_model<F, Fut>(body: F)
 where
-    F: FnOnce(LoadedModel) -> Fut,
-    Fut: Future<Output = LoadedModel>,
+    F: FnOnce(Runtime, InstanceId) -> Fut,
+    Fut: Future<Output = (Runtime, InstanceId)>,
 {
     let Ok(backend) = LlamaCppBackend::from_env() else {
         eprintln!("SKIPPED: no backend available. Set {EXECUTABLE_ENV} to run.");
@@ -91,7 +91,8 @@ where
         .id
         .clone();
 
-    let loaded = ModelLoader::new(backend)
+    let runtime = Runtime::new(backend);
+    let instance = runtime
         .load(
             &registry,
             &id,
@@ -105,16 +106,23 @@ where
         .await
         .unwrap_or_else(|err| panic!("{} did not load: {err}", container.display()));
 
-    let loaded = body(loaded).await;
-    loaded.unload().await.expect("unloads");
+    let (runtime, instance) = body(runtime, instance).await;
+    // A body may have unloaded already, which is not a failure to clean up.
+    match runtime.unload(&instance).await {
+        Ok(_) | Err(RuntimeError::UnknownInstance { .. }) => {}
+        Err(err) => panic!("the instance did not unload: {err}"),
+    }
 }
 
 #[tokio::test]
 async fn an_embedding_request_returns_a_usable_vector() {
     let _exclusive = exclusive().await;
-    with_embedding_model(|loaded| async move {
+    with_embedding_model(|runtime, id| async move {
         let request = EmbedRequest::single(format!("{QUERY_PREFIX}What is virtual memory?"));
-        let result = loaded.embed(&request).await.expect("the model embeds");
+        let result = runtime
+            .embed(&id, &request)
+            .await
+            .expect("the model embeds");
 
         assert_eq!(result.embeddings.len(), 1, "one input, one vector");
         let embedding = result.for_input(0).expect("attributable to input 0");
@@ -137,7 +145,7 @@ async fn an_embedding_request_returns_a_usable_vector() {
             "embedded one input: dimension {}, norm {norm:.6}",
             embedding.dimension()
         );
-        loaded
+        (runtime, id)
     })
     .await;
 }
@@ -147,18 +155,19 @@ async fn the_dimension_is_stable_across_requests() {
     // Discovered from the first result rather than asserted against a constant, so
     // the test stays about the runtime rather than about this particular model.
     let _exclusive = exclusive().await;
-    with_embedding_model(|loaded| async move {
-        let first = loaded
-            .embed(&EmbedRequest::single(format!("{QUERY_PREFIX}first")))
+    with_embedding_model(|runtime, id| async move {
+        let first = runtime
+            .embed(&id, &EmbedRequest::single(format!("{QUERY_PREFIX}first")))
             .await
             .expect("embeds");
         let expected = first.dimension().expect("a consistent dimension");
 
         for round in 0..3 {
-            let again = loaded
-                .embed(&EmbedRequest::single(format!(
-                    "{QUERY_PREFIX}round {round}"
-                )))
+            let again = runtime
+                .embed(
+                    &id,
+                    &EmbedRequest::single(format!("{QUERY_PREFIX}round {round}")),
+                )
                 .await
                 .expect("embeds");
             assert_eq!(
@@ -167,7 +176,7 @@ async fn the_dimension_is_stable_across_requests() {
                 "dimension changed between requests to one loaded instance"
             );
         }
-        loaded
+        (runtime, id)
     })
     .await;
 }
@@ -175,12 +184,12 @@ async fn the_dimension_is_stable_across_requests() {
 #[tokio::test]
 async fn a_batch_returns_one_independently_indexed_vector_per_input() {
     let _exclusive = exclusive().await;
-    with_embedding_model(|loaded| async move {
+    with_embedding_model(|runtime, id| async move {
         let request = EmbedRequest::batch([
             format!("{QUERY_PREFIX}What is virtual memory?"),
             format!("{QUERY_PREFIX}How do I bake a cake?"),
         ]);
-        let result = loaded.embed(&request).await.expect("embeds a batch");
+        let result = runtime.embed(&id, &request).await.expect("embeds a batch");
 
         assert_eq!(result.embeddings.len(), 2);
         let first = result.for_input(0).expect("input 0 answered");
@@ -195,7 +204,7 @@ async fn a_batch_returns_one_independently_indexed_vector_per_input() {
             "two unrelated inputs produced an identical vector, which suggests the \
              input was not reaching the model"
         );
-        loaded
+        (runtime, id)
     })
     .await;
 }
@@ -203,14 +212,14 @@ async fn a_batch_returns_one_independently_indexed_vector_per_input() {
 #[tokio::test]
 async fn the_same_input_embeds_consistently() {
     let _exclusive = exclusive().await;
-    with_embedding_model(|loaded| async move {
+    with_embedding_model(|runtime, id| async move {
         let input = format!("{QUERY_PREFIX}What is virtual memory?");
-        let first = loaded
-            .embed(&EmbedRequest::single(input.clone()))
+        let first = runtime
+            .embed(&id, &EmbedRequest::single(input.clone()))
             .await
             .expect("embeds");
-        let second = loaded
-            .embed(&EmbedRequest::single(input))
+        let second = runtime
+            .embed(&id, &EmbedRequest::single(input))
             .await
             .expect("embeds again");
 
@@ -230,7 +239,7 @@ async fn the_same_input_embeds_consistently() {
             drift < 1e-3,
             "the same input embedded differently, largest component drift {drift}"
         );
-        loaded
+        (runtime, id)
     })
     .await;
 }
@@ -239,25 +248,28 @@ async fn the_same_input_embeds_consistently() {
 async fn embeddings_are_only_verified_by_performing_one() {
     // The claim this whole slice exists to establish.
     let _exclusive = exclusive().await;
-    with_embedding_model(|mut loaded| async move {
+    with_embedding_model(|runtime, id| async move {
         assert!(
-            !loaded
-                .instance()
+            !runtime
+                .instance(&id)
+                .expect("resident")
                 .capabilities()
                 .is_verified(ModelCapability::Embeddings),
             "loading must not verify a capability; only performing one may"
         );
 
-        loaded
-            .verify_embeddings(&EmbedRequest::single(format!(
-                "{QUERY_PREFIX}What is virtual memory?"
-            )))
+        runtime
+            .verify_embeddings(
+                &id,
+                &EmbedRequest::single(format!("{QUERY_PREFIX}What is virtual memory?")),
+            )
             .await
             .expect("the model embeds");
 
         assert!(
-            loaded
-                .instance()
+            runtime
+                .instance(&id)
+                .expect("resident")
                 .capabilities()
                 .is_verified(ModelCapability::Embeddings),
             "a successful embedding should have verified the capability"
@@ -265,8 +277,9 @@ async fn embeddings_are_only_verified_by_performing_one() {
 
         // Verification belongs to this live instance on this backend build, and is
         // recorded with the build that demonstrated it.
-        let state = loaded
-            .instance()
+        let state = runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .state(ModelCapability::Embeddings);
         eprintln!("embeddings capability is now {state}");
@@ -279,11 +292,15 @@ async fn embeddings_are_only_verified_by_performing_one() {
             ModelCapability::StructuredOutput,
         ] {
             assert!(
-                !loaded.instance().capabilities().is_verified(other),
+                !runtime
+                    .instance(&id)
+                    .expect("resident")
+                    .capabilities()
+                    .is_verified(other),
                 "{other} was verified without being demonstrated"
             );
         }
-        loaded
+        (runtime, id)
     })
     .await;
 }
@@ -309,61 +326,67 @@ async fn verification_does_not_survive_the_instance() {
         .artifact()
         .id
         .clone();
-    let loader = ModelLoader::new(backend);
+    let runtime = Runtime::new(backend);
     let deadlines = Deadlines {
         startup: Duration::from_secs(90),
         shutdown: Duration::from_secs(10),
         health: Duration::from_secs(5),
     };
 
-    let mut first = loader
+    let first = runtime
         .load(&registry, &id, worker_id(), deadlines)
         .await
         .expect("loads");
-    first
-        .verify_embeddings(&EmbedRequest::single(format!("{QUERY_PREFIX}hello")))
+    runtime
+        .verify_embeddings(
+            &first,
+            &EmbedRequest::single(format!("{QUERY_PREFIX}hello")),
+        )
         .await
         .expect("embeds");
     assert!(
-        first
-            .instance()
+        runtime
+            .instance(&first)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::Embeddings)
     );
-    first.unload().await.expect("unloads");
+    runtime.unload(&first).await.expect("unloads");
 
-    let second = loader
+    let second = runtime
         .load(&registry, &id, worker_id(), deadlines)
         .await
         .expect("loads again");
     assert!(
-        !second
-            .instance()
+        !runtime
+            .instance(&second)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::Embeddings),
         "a new instance inherited a verification it never demonstrated"
     );
-    second.unload().await.expect("unloads");
+    runtime.unload(&second).await.expect("unloads");
 }
 
 #[tokio::test]
-async fn a_request_to_an_instance_that_is_not_serving_is_refused() {
-    // Nothing is sent to a backend for an instance that has stopped serving, so
-    // the caller gets a clear refusal rather than a transport error from a socket
-    // nobody is listening on.
+async fn a_request_to_an_instance_that_is_gone_is_refused() {
+    // Nothing is sent to a backend for an instance the runtime no longer holds,
+    // so the caller gets a clear refusal rather than a transport error from a
+    // socket nobody is listening on. The identifier is not reused, so a stale one
+    // can never reach a later model either.
     let _exclusive = exclusive().await;
-    with_embedding_model(|loaded| async move {
-        loaded.unload().await.expect("unloads");
+    with_embedding_model(|runtime, id| async move {
+        runtime.unload(&id).await.expect("unloads");
 
-        let err = loaded
-            .embed(&EmbedRequest::single("x"))
+        let err = runtime
+            .embed(&id, &EmbedRequest::single("x"))
             .await
             .expect_err("an unloaded instance must not serve requests");
         assert!(
-            matches!(err, LoadError::NotUsable { .. }),
-            "expected NotUsable, got {err}"
+            matches!(err, RuntimeError::UnknownInstance { .. }),
+            "expected UnknownInstance, got {err}"
         );
-        loaded
+        (runtime, id)
     })
     .await;
 }

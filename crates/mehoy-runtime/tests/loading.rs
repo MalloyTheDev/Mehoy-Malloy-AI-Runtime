@@ -15,7 +15,7 @@ use mehoy_backend_llama::{EXECUTABLE_ENV, LlamaCppBackend};
 use mehoy_core::id::IdAllocator;
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::{ArtifactId, ArtifactRegistry};
-use mehoy_runtime::{InstanceState, LoadError, ModelCapability, ModelLoader};
+use mehoy_runtime::{InstanceState, LoadError, ModelCapability, Runtime, RuntimeError};
 
 fn worker_id() -> mehoy_core::id::WorkerId {
     static IDS: std::sync::LazyLock<IdAllocator> = std::sync::LazyLock::new(IdAllocator::new);
@@ -30,9 +30,9 @@ fn deadlines() -> Deadlines {
     }
 }
 
-fn loader() -> Option<ModelLoader> {
+fn runtime() -> Option<Runtime> {
     match LlamaCppBackend::from_env() {
-        Ok(backend) => Some(ModelLoader::new(backend)),
+        Ok(backend) => Some(Runtime::new(backend)),
         Err(err) => {
             eprintln!("SKIPPED: no backend available ({err}). Set {EXECUTABLE_ENV} to run.");
             None
@@ -172,10 +172,10 @@ async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
 
 #[tokio::test]
 async fn an_unknown_artifact_is_refused() {
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let registry = ArtifactRegistry::open_in_memory().expect("registry opens");
 
-    let err = loader
+    let err = runtime
         .load(
             &registry,
             &ArtifactId::from_stored("no-such-artifact"),
@@ -189,14 +189,17 @@ async fn an_unknown_artifact_is_refused() {
     // backend is ever asked to start. A global process count would be a weaker
     // assertion and a flaky one, since other tests start backends concurrently.
     assert!(
-        matches!(err, LoadError::UnknownArtifact { .. }),
+        matches!(
+            err,
+            RuntimeError::Instance(LoadError::UnknownArtifact { .. })
+        ),
         "expected UnknownArtifact, got {err}"
     );
 }
 
 #[tokio::test]
 async fn an_artifact_whose_file_was_removed_is_refused() {
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let dir = tempfile::tempdir().expect("temp dir");
     let path = write_file(dir.path(), "model.gguf", &synthetic_container());
     let mut registry = ArtifactRegistry::open_in_memory().expect("registry opens");
@@ -209,13 +212,16 @@ async fn an_artifact_whose_file_was_removed_is_refused() {
 
     std::fs::remove_file(&path).expect("removes");
 
-    let err = loader
+    let err = runtime
         .load(&registry, &id, worker_id(), deadlines())
         .await
         .expect_err("a missing file must be refused");
 
     assert!(
-        matches!(err, LoadError::ArtifactMissing { .. }),
+        matches!(
+            err,
+            RuntimeError::Instance(LoadError::ArtifactMissing { .. })
+        ),
         "expected ArtifactMissing, got {err}"
     );
 }
@@ -224,7 +230,7 @@ async fn an_artifact_whose_file_was_removed_is_refused() {
 async fn a_drifted_artifact_is_refused_rather_than_loaded() {
     // The registry recorded what was inspected. Loading a file that has since been
     // replaced would run something nobody validated.
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let dir = tempfile::tempdir().expect("temp dir");
     let path = write_file(dir.path(), "model.gguf", &synthetic_container());
     let mut registry = ArtifactRegistry::open_in_memory().expect("registry opens");
@@ -239,13 +245,15 @@ async fn a_drifted_artifact_is_refused_rather_than_loaded() {
     replacement.extend_from_slice(b"different length now");
     write_file(dir.path(), "model.gguf", &replacement);
 
-    let err = loader
+    let err = runtime
         .load(&registry, &id, worker_id(), deadlines())
         .await
         .expect_err("a drifted artifact must be refused");
 
     match err {
-        LoadError::ArtifactChanged { reason, .. } => assert!(reason.contains("size"), "{reason}"),
+        RuntimeError::Instance(LoadError::ArtifactChanged { reason, .. }) => {
+            assert!(reason.contains("size"), "{reason}")
+        }
         other => panic!("expected ArtifactChanged, got {other}"),
     }
 }
@@ -254,7 +262,7 @@ async fn a_drifted_artifact_is_refused_rather_than_loaded() {
 async fn an_incompatible_artifact_is_refused_before_spawning() {
     // A projector cannot be served alone, and the preflight knows it, so no process
     // start should be spent discovering that.
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let projector = real_containers().into_iter().find(|path| {
         path.file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with("mmproj"))
@@ -272,13 +280,15 @@ async fn an_incompatible_artifact_is_refused_before_spawning() {
         .id
         .clone();
 
-    let err = loader
+    let err = runtime
         .load(&registry, &id, worker_id(), deadlines())
         .await
         .expect_err("a projector must be refused");
 
     match err {
-        LoadError::Incompatible { reason } => assert!(reason.contains("projector"), "{reason}"),
+        RuntimeError::Instance(LoadError::Incompatible { reason }) => {
+            assert!(reason.contains("projector"), "{reason}")
+        }
         other => panic!("expected Incompatible, got {other}"),
     }
 }
@@ -288,7 +298,7 @@ async fn a_backend_that_cannot_load_the_artifact_leaves_nothing_running() {
     let _exclusive = exclusive().await;
     // The synthetic container is structurally valid GGUF with no tensors, so the
     // backend starts and then fails to load it. That is the realistic failure.
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let dir = tempfile::tempdir().expect("temp dir");
     let path = write_file(dir.path(), "model.gguf", &synthetic_container());
     let mut registry = ArtifactRegistry::open_in_memory().expect("registry opens");
@@ -300,7 +310,7 @@ async fn a_backend_that_cannot_load_the_artifact_leaves_nothing_running() {
         .clone();
     let before = backend_process_count();
 
-    let err = loader
+    let err = runtime
         .load(
             &registry,
             &id,
@@ -314,7 +324,7 @@ async fn a_backend_that_cannot_load_the_artifact_leaves_nothing_running() {
         .expect_err("an unloadable container must fail");
 
     assert!(
-        matches!(err, LoadError::Backend(_)),
+        matches!(err, RuntimeError::Instance(LoadError::Backend(_))),
         "expected a backend failure, got {err}"
     );
 
@@ -333,7 +343,7 @@ async fn a_failure_after_readiness_still_tears_the_backend_down() {
     // The hardest path. Everything else fails before a process exists; this one
     // fails while a backend is healthy, authenticated, and holding memory. Without
     // an explicit rollback it would be leaked.
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some(container) = smallest_real_container() else {
         eprintln!("SKIPPED: no real container available to reach readiness");
         return;
@@ -350,14 +360,16 @@ async fn a_failure_after_readiness_still_tears_the_backend_down() {
     let before = backend_process_count();
     mehoy_runtime::fail_next_commit();
 
-    let err = loader
+    let err = runtime
         .load(&registry, &id, worker_id(), deadlines())
         .await
         .expect_err("the injected failure must surface");
     mehoy_runtime::clear_injected_faults();
 
     match err {
-        LoadError::Instance { reason } => assert!(reason.contains("injected"), "{reason}"),
+        RuntimeError::Instance(LoadError::Instance { reason }) => {
+            assert!(reason.contains("injected"), "{reason}")
+        }
         other => panic!("expected an instance failure, got {other}"),
     }
 
@@ -374,7 +386,7 @@ async fn a_failure_after_readiness_still_tears_the_backend_down() {
 #[tokio::test]
 async fn a_registered_artifact_loads_and_yields_one_instance() {
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some(container) = smallest_real_container() else {
         eprintln!("SKIPPED: no real container available on this machine");
         return;
@@ -388,7 +400,7 @@ async fn a_registered_artifact_loads_and_yields_one_instance() {
         .clone();
     let before = backend_process_count();
 
-    let loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .unwrap_or_else(|err| panic!("{} did not load: {err}", container.display()));
@@ -402,7 +414,7 @@ async fn a_registered_artifact_loads_and_yields_one_instance() {
          assertions built on it prove nothing"
     );
 
-    let instance = loaded.instance();
+    let instance = runtime.instance(&id).expect("resident");
     assert_eq!(instance.state(), &InstanceState::BackendReady);
     assert!(instance.state().is_usable());
 
@@ -424,7 +436,7 @@ async fn a_registered_artifact_loads_and_yields_one_instance() {
             .map_or_else(|| "?".to_owned(), ToString::to_string)
     );
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         backend_process_count(),
@@ -439,7 +451,7 @@ async fn readiness_does_not_claim_any_capability() {
     // The reason an embedding model was chosen first. Reaching BackendReady means
     // the artifact loaded and the backend answers authenticated requests. It must
     // not quietly become a claim that generation works.
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some(container) = smallest_real_container() else {
         eprintln!("SKIPPED: no real container available on this machine");
         return;
@@ -453,12 +465,12 @@ async fn readiness_does_not_claim_any_capability() {
         .id
         .clone();
 
-    let loaded = loader
+    let id = runtime
         .load(&registry, &id, worker_id(), deadlines())
         .await
         .expect("loads");
 
-    let capabilities = loaded.instance().capabilities();
+    let capabilities = runtime.instance(&id).expect("resident").capabilities();
     for capability in [
         ModelCapability::TextGeneration,
         ModelCapability::Embeddings,
@@ -473,5 +485,5 @@ async fn readiness_does_not_claim_any_capability() {
         );
     }
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }

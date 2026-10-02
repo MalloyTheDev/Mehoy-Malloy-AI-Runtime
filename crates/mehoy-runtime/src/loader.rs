@@ -321,19 +321,32 @@ impl fmt::Display for UnloadOutcome {
 }
 
 impl LoadedModel {
+    /// This instance's identifier.
     #[must_use]
-    pub fn instance(&self) -> &ModelInstance {
-        &self.instance
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance.id().clone()
     }
 
-    pub fn instance_mut(&mut self) -> &mut ModelInstance {
-        &mut self.instance
+    /// A copy of what is known about this instance.
+    #[must_use]
+    pub fn instance_snapshot(&self) -> ModelInstance {
+        self.instance.clone()
     }
 
-    /// The private channel to the backend serving this model.
+    /// Where this model's backend listens.
     #[must_use]
-    pub const fn channel(&self) -> &BackendChannel {
-        &self.channel
+    pub fn backend_address(&self) -> std::net::SocketAddr {
+        self.channel.address()
+    }
+
+    /// Whether anything still answers on this model's backend address.
+    ///
+    /// Exists so teardown can be checked without handing out the channel, and so
+    /// nothing outside this crate needs the credential to do it.
+    pub async fn backend_reachable(&self) -> bool {
+        tokio::net::TcpStream::connect(self.channel.address())
+            .await
+            .is_ok()
     }
 
     /// Whether this instance is still serving, being torn down, or gone.
@@ -433,14 +446,12 @@ impl LoadedModel {
     /// Returns whatever [`LoadedModel::embed`] returns. The capability is unchanged
     /// on failure.
     pub async fn verify_embeddings(
-        &mut self,
+        &self,
         request: &EmbedRequest,
     ) -> Result<EmbeddingResult, LoadError> {
         let result = self.embed(request).await?;
-        let backend = self.identity.clone();
         self.instance
-            .capabilities_mut()
-            .verify(ModelCapability::Embeddings, backend);
+            .verify(ModelCapability::Embeddings, self.identity.clone());
         Ok(result)
     }
 
@@ -514,39 +525,13 @@ impl LoadedModel {
     /// Returns whatever [`LoadedModel::generate_text`] returns. The capability is
     /// unchanged on failure, because a refusal is not evidence of absence.
     pub async fn verify_text_generation(
-        &mut self,
+        &self,
         request: &GenerateTextRequest,
     ) -> Result<GenerationResult, LoadError> {
         let result = self.generate_text(request).await?;
-        let backend = self.identity.clone();
         self.instance
-            .capabilities_mut()
-            .verify(ModelCapability::TextGeneration, backend);
+            .verify(ModelCapability::TextGeneration, self.identity.clone());
         Ok(result)
-    }
-
-    /// Begins continuing text, delivering it incrementally.
-    ///
-    /// Returns as soon as the runtime owns the request. It does not wait for the
-    /// backend, which on a measured engine can spend more than ten seconds reading
-    /// a large prompt before answering at all. Waiting for that would leave the
-    /// caller holding nothing to cancel during exactly the period when cancelling
-    /// matters most. ADR-0009 records the reasoning.
-    ///
-    /// Because nothing is awaited here, a backend refusal is not reported by this
-    /// call. It arrives through the stream, alongside every other way the request
-    /// can fail.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoadError::NotUsable`] when the instance is not ready and
-    /// [`LoadError::InvalidRequest`] when a parameter cannot be honoured. Both are
-    /// decided before a request is accepted, so neither creates one.
-    pub fn generate_stream(
-        &self,
-        request: &GenerateTextRequest,
-    ) -> Result<GenerationRequest, LoadError> {
-        self.generate_stream_within(request, RequestBudget::default())
     }
 
     /// The same, with an explicit budget.
@@ -678,25 +663,13 @@ impl LoadedModel {
     /// it. A refusal is not proof of absence, and this is a record of what has been
     /// demonstrated, not a health check: whether the instance is currently well is
     /// [`ModelInstance::state`].
-    pub fn record_generation_stream(&mut self, stream: &GenerationStream) -> bool {
+    pub fn record_generation_stream(&self, stream: &GenerationStream) -> bool {
         if !stream.demonstrated_generation() {
             return false;
         }
-        let backend = self.identity.clone();
         self.instance
-            .capabilities_mut()
-            .verify(ModelCapability::TextGeneration, backend);
+            .verify(ModelCapability::TextGeneration, self.identity.clone());
         true
-    }
-
-    /// Stops the backend and destroys the instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the backend had to be killed rather than stopping
-    /// politely. The backend is stopped either way.
-    pub async fn unload(&self) -> Result<UnloadOutcome, LoadError> {
-        self.unload_within(UnloadBudget::default()).await
     }
 
     /// The same, with an explicit drain budget.
@@ -976,7 +949,3 @@ fn injected_commit_fault() -> Result<(), String> {
 fn injected_commit_fault() -> Result<(), String> {
     Ok(())
 }
-
-/// Re-exported so callers can name the verdict without depending on the backend
-/// crate directly.
-pub use mehoy_backend_llama::Compatibility as BackendCompatibility;

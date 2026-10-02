@@ -16,24 +16,23 @@ use mehoy_core::cancel::{CancellationCause, RequestState, UnloadBudget};
 use mehoy_core::inference::{
     GenerateTextRequest, GenerationEvent, GenerationParameters, GenerationStream,
 };
-use mehoy_runtime::{LifecyclePhase, LoadError, LoadedModel, ModelCapability, UnloadOutcome};
+use mehoy_runtime::{
+    InstanceId, LifecyclePhase, LoadError, ModelCapability, Runtime, RuntimeError, UnloadOutcome,
+};
 
 mod common;
-use common::{deadlines, exclusive, generative_artifact, loader, survey, worker_id};
+use common::{
+    deadlines, exclusive, generative_artifact, loaded_generative, runtime, survey, worker_id,
+};
 
-async fn loaded() -> Option<LoadedModel> {
-    let loader = loader()?;
-    let (registry, artifacts) = survey()?;
-    let artifact = generative_artifact(&artifacts).or_else(|| {
-        eprintln!("SKIPPED: no text-generative container found on this machine");
-        None
-    })?;
-    Some(
-        loader
-            .load(&registry, &artifact.id, worker_id(), deadlines())
-            .await
-            .expect("loads"),
-    )
+/// Loads the generative container and keeps the runtime that owns it.
+///
+/// The runtime is returned alongside the identifier because it holds the model:
+/// dropping it would take the instance down with it.
+async fn loaded() -> Option<(Runtime, InstanceId)> {
+    loaded_generative()
+        .await
+        .map(|(runtime, _registry, id)| (runtime, id))
 }
 
 fn long_request() -> GenerateTextRequest {
@@ -72,28 +71,34 @@ async fn terminal(stream: &mut GenerationStream) -> Option<GenerationEvent> {
     last
 }
 
-/// Whether anything still answers on the backend's address.
-async fn backend_reachable(model: &LoadedModel) -> bool {
-    tokio::net::TcpStream::connect(model.channel().address())
-        .await
-        .is_ok()
-}
-
 #[tokio::test]
 async fn unloading_an_idle_instance_tears_it_down() {
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
-
-    assert_eq!(loaded.phase(), LifecyclePhase::Serving);
-    assert!(backend_reachable(&loaded).await, "the backend should be up");
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
     assert_eq!(
-        loaded.unload().await.expect("unloads"),
+        runtime.phase(&id).expect("resident"),
+        LifecyclePhase::Serving
+    );
+    assert!(
+        runtime.backend_reachable(&id).await.unwrap_or(false),
+        "the backend should be up"
+    );
+
+    let address = runtime.backend_address(&id).expect("resident");
+
+    assert_eq!(
+        runtime.unload(&id).await.expect("unloads"),
         UnloadOutcome::Drained { cancelled: 0 }
     );
-    assert_eq!(loaded.phase(), LifecyclePhase::Unloaded);
     assert!(
-        !backend_reachable(&loaded).await,
+        runtime.instance(&id).is_none(),
+        "a completed unload left the instance addressable"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(address).await.is_err(),
         "something is still listening after the worker was stopped"
     );
 }
@@ -101,17 +106,20 @@ async fn unloading_an_idle_instance_tears_it_down() {
 #[tokio::test]
 async fn unloading_twice_is_reported_rather_than_repeated() {
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
     assert!(matches!(
-        loaded.unload().await.expect("unloads"),
+        runtime.unload(&id).await.expect("unloads"),
         UnloadOutcome::Drained { .. }
     ));
-    assert_eq!(
-        loaded.unload().await.expect("second unload"),
-        UnloadOutcome::AlreadyUnloaded
-    );
-    assert_eq!(loaded.phase(), LifecyclePhase::Unloaded);
+    // The instance is forgotten once it is down, so a second attempt addresses
+    // nothing rather than reporting on something that no longer exists.
+    assert!(matches!(
+        runtime.unload(&id).await,
+        Err(RuntimeError::UnknownInstance { .. })
+    ));
 }
 
 #[tokio::test]
@@ -119,21 +127,22 @@ async fn no_request_is_admitted_once_unloading_has_begun() {
     // The invariant. A request accepted after this point would be put onto a model
     // that is being destroyed.
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 
-    match loaded.generate_stream(&short_request()) {
-        Err(LoadError::NotUsable { state }) => {
-            assert!(
-                state.contains("unload"),
-                "the refusal should say the instance is gone, got {state}"
-            );
-        }
+    match runtime.generate_stream(&id, &short_request()) {
+        // Either answer is a refusal. Which one depends on whether teardown has
+        // finished and forgotten the instance, and both keep the work away from a
+        // backend that is going or gone.
+        Err(RuntimeError::UnknownInstance { .. })
+        | Err(RuntimeError::Instance(LoadError::NotUsable { .. })) => {}
         Err(other) => panic!("expected a refusal, got {other}"),
         Ok(_) => panic!("a request was admitted onto an unloaded instance"),
     }
-    assert_eq!(loaded.active_requests(), 0);
+    assert_eq!(runtime.active_requests(&id), None);
 }
 
 #[tokio::test]
@@ -141,10 +150,12 @@ async fn a_request_in_flight_is_stopped_by_unloading_and_says_why() {
     // Unloading does not end requests by a second mechanism. It uses the same one
     // everything else uses, and the cause records what actually happened.
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
-    let started = loaded
-        .generate_stream(&long_request())
+    let started = runtime
+        .generate_stream(&id, &long_request())
         .expect("the request is accepted");
     let request_id = started.request_id;
     let mut stream = started.stream;
@@ -155,9 +166,9 @@ async fn a_request_in_flight_is_stopped_by_unloading_and_says_why() {
             break;
         }
     }
-    assert_eq!(loaded.active_requests(), 1);
+    assert_eq!(runtime.active_requests(&id).unwrap_or(0), 1);
 
-    let outcome = loaded.unload().await.expect("unloads");
+    let outcome = runtime.unload(&id).await.expect("unloads");
     assert!(
         matches!(outcome, UnloadOutcome::Drained { cancelled: 1 }),
         "expected one request to have been drained, got {outcome}"
@@ -175,7 +186,10 @@ async fn a_request_in_flight_is_stopped_by_unloading_and_says_why() {
         other => panic!("expected a cancellation, got {other:?}"),
     }
     let _ = request_id;
-    assert_eq!(loaded.phase(), LifecyclePhase::Unloaded);
+    assert!(
+        runtime.instance(&id).is_none(),
+        "a completed unload left the instance addressable"
+    );
 }
 
 #[tokio::test]
@@ -183,10 +197,12 @@ async fn unloading_a_request_that_is_already_stopping_does_not_corrupt_its_outco
     // Both are asking for the same thing at once. The request must still reach
     // exactly one terminal state, and must keep the reason it was first given.
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
-    let started = loaded
-        .generate_stream(&long_request())
+    let started = runtime
+        .generate_stream(&id, &long_request())
         .expect("the request is accepted");
     let mut stream = started.stream;
     while let Some(Ok(event)) = stream.next().await {
@@ -195,13 +211,13 @@ async fn unloading_a_request_that_is_already_stopping_does_not_corrupt_its_outco
         }
     }
 
-    loaded.cancel(started.request_id).expect("cancels");
+    runtime.cancel(&id, started.request_id).expect("cancels");
     assert_eq!(
-        loaded.request_state(started.request_id),
+        runtime.request_state(&id, started.request_id),
         Some(RequestState::Cancelling)
     );
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 
     let mut terminals = 0usize;
     let mut cause = None;
@@ -230,18 +246,24 @@ async fn unloading_reports_when_it_stopped_waiting() {
     // A drain budget that expires is not a failure. It means the instance stopped
     // waiting and went ahead, which is honest only if it says so.
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
-    let started = loaded
-        .generate_stream(&long_request())
+    let started = runtime
+        .generate_stream(&id, &long_request())
         .expect("the request is accepted");
     // Deliberately not read, and given no time to settle.
     let _stream = started.stream;
+    let address = runtime.backend_address(&id).expect("resident");
 
-    let outcome = loaded
-        .unload_within(UnloadBudget {
-            drain: Duration::ZERO,
-        })
+    let outcome = runtime
+        .unload_within(
+            &id,
+            UnloadBudget {
+                drain: Duration::ZERO,
+            },
+        )
         .await
         .expect("unloads");
 
@@ -258,9 +280,9 @@ async fn unloading_reports_when_it_stopped_waiting() {
         other => panic!("unexpected outcome {other}"),
     }
 
-    assert_eq!(loaded.phase(), LifecyclePhase::Unloaded);
+    assert!(runtime.instance(&id).is_none());
     assert!(
-        !backend_reachable(&loaded).await,
+        tokio::net::TcpStream::connect(address).await.is_err(),
         "the worker outlived an escalated unload"
     );
 }
@@ -268,26 +290,28 @@ async fn unloading_reports_when_it_stopped_waiting() {
 #[tokio::test]
 async fn an_abandoned_request_does_not_hold_up_unloading() {
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
-    let started = loaded
-        .generate_stream(&long_request())
+    let started = runtime
+        .generate_stream(&id, &long_request())
         .expect("the request is accepted");
     drop(started.stream);
 
     // The request ends on its own, because nothing is reading it.
     for _ in 0..100 {
-        if loaded.active_requests() == 0 {
+        if runtime.active_requests(&id).unwrap_or(0) == 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     assert!(matches!(
-        loaded.unload().await.expect("unloads"),
+        runtime.unload(&id).await.expect("unloads"),
         UnloadOutcome::Drained { .. }
     ));
-    assert_eq!(loaded.phase(), LifecyclePhase::Unloaded);
+    assert!(runtime.instance(&id).is_none());
 }
 
 #[tokio::test]
@@ -296,7 +320,9 @@ async fn nothing_survives_an_unload_except_the_artifact() {
     // everything it had demonstrated; it does not deregister the artifact, which
     // is a record of a file on disk rather than of a running thing.
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else {
+        return;
+    };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -305,31 +331,39 @@ async fn nothing_survives_an_unload_except_the_artifact() {
         return;
     };
 
-    let mut first = loader
+    let first_id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
-    let first_id = first.instance().id().clone();
 
-    let started = first
-        .generate_stream(&short_request())
+    let started = runtime
+        .generate_stream(&first_id, &short_request())
         .expect("the request is accepted");
     let mut stream = started.stream;
     assert!(matches!(
         terminal(&mut stream).await,
         Some(GenerationEvent::Completed { .. })
     ));
-    assert!(first.record_generation_stream(&stream));
     assert!(
-        first
-            .instance()
+        runtime
+            .record_generation_stream(&first_id, &stream)
+            .expect("resident")
+    );
+    assert!(
+        runtime
+            .instance(&first_id)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "the setup needs a verified capability to prove it does not survive"
     );
 
-    first.unload().await.expect("unloads");
-    assert_eq!(first.active_requests(), 0, "requests outlived the instance");
+    runtime.unload(&first_id).await.expect("unloads");
+    assert_eq!(
+        runtime.active_requests(&first_id),
+        None,
+        "an unloaded instance is still resident"
+    );
 
     // The artifact is untouched.
     assert!(
@@ -341,24 +375,24 @@ async fn nothing_survives_an_unload_except_the_artifact() {
     );
 
     // A reload is a different instance that has demonstrated nothing.
-    let second = loader
+    let second_id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("reloads");
     assert_ne!(
-        second.instance().id(),
-        &first_id,
+        second_id, first_id,
         "a reload reused the identifier of an instance that no longer exists"
     );
     assert!(
-        !second
-            .instance()
+        !runtime
+            .instance(&second_id)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "a fresh instance inherited a capability it never demonstrated"
     );
 
-    second.unload().await.expect("unloads");
+    runtime.unload(&second_id).await.expect("unloads");
 }
 
 #[tokio::test]
@@ -367,22 +401,26 @@ async fn no_task_class_is_admitted_once_unloading_has_begun() {
     // the backend through its own check rather than through admission is invisible
     // to unloading, and would be sent to a worker that is being destroyed.
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 
     // Streaming.
     assert!(
         matches!(
-            loaded.generate_stream(&short_request()),
-            Err(LoadError::NotUsable { .. })
+            runtime.generate_stream(&id, &short_request()),
+            Err(RuntimeError::UnknownInstance { .. })
+                | Err(RuntimeError::Instance(LoadError::NotUsable { .. }))
         ),
         "streaming was admitted onto an unloaded instance"
     );
 
     // Whole-response generation.
-    match loaded.generate_text(&short_request()).await {
-        Err(LoadError::NotUsable { .. }) => {}
+    match runtime.generate_text(&id, &short_request()).await {
+        Err(RuntimeError::UnknownInstance { .. })
+        | Err(RuntimeError::Instance(LoadError::NotUsable { .. })) => {}
         other => {
             panic!("whole-response generation was admitted onto an unloaded instance: {other:?}")
         }
@@ -390,15 +428,16 @@ async fn no_task_class_is_admitted_once_unloading_has_begun() {
 
     // Embedding. This instance is not an embedding model, which is the point:
     // admission must refuse before the task ever reaches a backend.
-    match loaded
-        .embed(&mehoy_core::inference::EmbedRequest::single("x"))
+    match runtime
+        .embed(&id, &mehoy_core::inference::EmbedRequest::single("x"))
         .await
     {
-        Err(LoadError::NotUsable { .. }) => {}
+        Err(RuntimeError::UnknownInstance { .. })
+        | Err(RuntimeError::Instance(LoadError::NotUsable { .. })) => {}
         other => panic!("embedding was admitted onto an unloaded instance: {other:?}"),
     }
 
-    assert_eq!(loaded.active_requests(), 0);
+    assert_eq!(runtime.active_requests(&id), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -409,24 +448,33 @@ async fn requests_racing_an_unload_are_admitted_or_refused_but_never_stranded() 
     // reaching a worker that is being destroyed, which shows up as a transport
     // error from a socket nobody is listening on.
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
-    let loaded = std::sync::Arc::new(loaded);
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
+    let runtime = std::sync::Arc::new(runtime);
 
     let mut racers = Vec::new();
     for _ in 0..8 {
-        let model = std::sync::Arc::clone(&loaded);
+        let shared = std::sync::Arc::clone(&runtime);
+        let instance = id.clone();
         racers.push(tokio::spawn(async move {
             let mut verdicts = Vec::new();
             for _ in 0..6 {
-                verdicts.push(match model.generate_text(&short_request()).await {
-                    Ok(_) => "served",
-                    Err(LoadError::NotUsable { .. }) => "refused",
-                    Err(LoadError::Stopped { .. }) => "stopped",
-                    Err(LoadError::Inference { detail }) => {
-                        panic!("a request reached a dying backend: {detail}")
-                    }
-                    Err(other) => panic!("unexpected failure: {other}"),
-                });
+                verdicts.push(
+                    match shared.generate_text(&instance, &short_request()).await {
+                        Ok(_) => "served",
+                        // Either the instance has gone, or it was still serving and
+                        // admission took the request. Both are legal; reaching a dying
+                        // backend is not.
+                        Err(RuntimeError::UnknownInstance { .. })
+                        | Err(RuntimeError::Instance(LoadError::NotUsable { .. })) => "refused",
+                        Err(RuntimeError::Instance(LoadError::Stopped { .. })) => "stopped",
+                        Err(RuntimeError::Instance(LoadError::Inference { detail })) => {
+                            panic!("a request reached a dying backend: {detail}")
+                        }
+                        Err(other) => panic!("unexpected failure: {other}"),
+                    },
+                );
             }
             verdicts
         }));
@@ -434,7 +482,7 @@ async fn requests_racing_an_unload_are_admitted_or_refused_but_never_stranded() 
 
     // Let some of them get through before pulling the instance out from under them.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let outcome = loaded.unload().await.expect("unloads");
+    let outcome = runtime.unload(&id).await.expect("unloads");
 
     let mut served = 0usize;
     let mut refused = 0usize;
@@ -455,8 +503,10 @@ async fn requests_racing_an_unload_are_admitted_or_refused_but_never_stranded() 
         refused > 0,
         "nothing was refused, so the race never actually happened"
     );
-    assert_eq!(loaded.phase(), LifecyclePhase::Unloaded);
-    assert_eq!(loaded.active_requests(), 0);
+    assert!(
+        runtime.instance(&id).is_none(),
+        "the instance survived its own teardown"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -464,16 +514,20 @@ async fn an_admitted_whole_response_request_is_visible_to_unloading() {
     // The other half: a request that got in before admission closed must be in the
     // set unloading cancels, not merely left to fail when its backend disappears.
     let _exclusive = exclusive().await;
-    let Some(loaded) = loaded().await else { return };
-    let loaded = std::sync::Arc::new(loaded);
+    let Some((runtime, id)) = loaded().await else {
+        return;
+    };
+    let runtime = std::sync::Arc::new(runtime);
 
-    let model = std::sync::Arc::clone(&loaded);
-    let in_flight = tokio::spawn(async move { model.generate_text(&long_request()).await });
+    let shared = std::sync::Arc::clone(&runtime);
+    let instance = id.clone();
+    let in_flight =
+        tokio::spawn(async move { shared.generate_text(&instance, &long_request()).await });
 
     // Wait until the runtime is actually holding the request.
     let mut admitted = false;
     for _ in 0..200 {
-        if loaded.active_requests() == 1 {
+        if runtime.active_requests(&id).unwrap_or(0) == 1 {
             admitted = true;
             break;
         }
@@ -481,7 +535,7 @@ async fn an_admitted_whole_response_request_is_visible_to_unloading() {
     }
     assert!(admitted, "a whole-response request was never registered");
 
-    let outcome = loaded.unload().await.expect("unloads");
+    let outcome = runtime.unload(&id).await.expect("unloads");
     assert!(
         matches!(
             outcome,
@@ -491,7 +545,7 @@ async fn an_admitted_whole_response_request_is_visible_to_unloading() {
     );
 
     match in_flight.await.expect("the request task did not panic") {
-        Err(LoadError::Stopped { cause }) => {
+        Err(RuntimeError::Instance(LoadError::Stopped { cause })) => {
             assert_eq!(cause, CancellationCause::InstanceUnloading);
         }
         other => panic!("expected the request to be stopped, got {other:?}"),

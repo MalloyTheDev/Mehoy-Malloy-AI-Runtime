@@ -12,11 +12,11 @@
 use std::time::Instant;
 
 use mehoy_backend_llama::compatibility::{self, LaunchMode};
-use mehoy_runtime::{InstanceState, LoadError, ModelCapability};
+use mehoy_runtime::{InstanceState, LoadError, ModelCapability, RuntimeError};
 
 mod common;
 use common::{
-    deadlines, describe, embedding_artifact, exclusive, generative_artifact, loader, survey,
+    deadlines, describe, embedding_artifact, exclusive, generative_artifact, runtime, survey,
     worker_id,
 };
 
@@ -61,7 +61,7 @@ fn the_preflight_separates_the_two_classes_without_the_runtime_asking() {
 #[tokio::test]
 async fn a_generative_artifact_loads_through_the_same_path() {
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -82,13 +82,13 @@ async fn a_generative_artifact_loads_through_the_same_path() {
     );
 
     let began = Instant::now();
-    let loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .unwrap_or_else(|err| panic!("{} did not load: {err}", artifact.path.display()));
     eprintln!("reached backend ready in {:?}", began.elapsed());
 
-    let instance = loaded.instance();
+    let instance = runtime.instance(&id).expect("resident");
     assert_eq!(instance.state(), &InstanceState::BackendReady);
     assert_eq!(instance.artifact_id(), &artifact.id);
     assert!(instance.backend().is_some());
@@ -114,7 +114,7 @@ async fn a_generative_artifact_loads_through_the_same_path() {
         .state(ModelCapability::TextGeneration);
     eprintln!("text generation is currently {generation}");
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
@@ -123,7 +123,7 @@ async fn both_model_classes_travel_the_same_public_call() {
     // runtime had grown separate entry points for the two classes, this test could
     // not be written the way it is: one loader, one call, one transaction.
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -143,12 +143,15 @@ async fn both_model_classes_travel_the_same_public_call() {
 
     // One call, twice, differing only in which artifact is named.
     for artifact in [embedding, generative] {
-        let loaded = loader
+        let id = runtime
             .load(&registry, &artifact.id, worker_id(), deadlines())
             .await
             .unwrap_or_else(|err| panic!("{} did not load: {err}", artifact.path.display()));
 
-        assert_eq!(loaded.instance().state(), &InstanceState::BackendReady);
+        assert_eq!(
+            runtime.instance(&id).expect("resident").state(),
+            &InstanceState::BackendReady
+        );
         eprintln!(
             "{:?} reached backend ready through the same call",
             artifact.metadata.architecture.as_deref().unwrap_or("?")
@@ -164,19 +167,23 @@ async fn both_model_classes_travel_the_same_public_call() {
             ModelCapability::StructuredOutput,
         ] {
             assert!(
-                !loaded.instance().capabilities().is_verified(capability),
+                !runtime
+                    .instance(&id)
+                    .expect("resident")
+                    .capabilities()
+                    .is_verified(capability),
                 "{capability} was verified merely by loading"
             );
         }
 
-        loaded.unload().await.expect("unloads");
+        runtime.unload(&id).await.expect("unloads");
     }
 }
 
 #[tokio::test]
 async fn a_reloaded_generative_instance_inherits_nothing() {
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -185,31 +192,34 @@ async fn a_reloaded_generative_instance_inherits_nothing() {
         return;
     };
 
-    let first = loader
+    let first = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
-    let first_id = first.instance().id().clone();
-    first.unload().await.expect("unloads");
+    runtime.unload(&first).await.expect("unloads");
 
-    let second = loader
+    let second = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads again");
 
     assert_ne!(
-        second.instance().id(),
-        &first_id,
+        second, first,
         "a reload must produce a new instance rather than resurrecting the old one"
     );
     assert!(
-        !second
-            .instance()
+        runtime.instance(&first).is_none(),
+        "an unloaded instance is still addressable"
+    );
+    assert!(
+        !runtime
+            .instance(&second)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "a fresh instance inherited a verification it never demonstrated"
     );
-    second.unload().await.expect("unloads");
+    runtime.unload(&second).await.expect("unloads");
 }
 
 // --------------------------------------------------------------- text generation
@@ -237,7 +247,7 @@ async fn a_generative_model_actually_generates() {
     use mehoy_core::inference::FinishReason;
 
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -246,13 +256,13 @@ async fn a_generative_model_actually_generates() {
         return;
     };
 
-    let loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
 
-    let result = loaded
-        .generate_text(&generation_request())
+    let result = runtime
+        .generate_text(&id, &generation_request())
         .await
         .expect("the model generates");
 
@@ -287,13 +297,13 @@ async fn a_generative_model_actually_generates() {
         result.text, result.finish_reason, result.usage
     );
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
 async fn generation_is_only_verified_by_generating() {
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -302,35 +312,38 @@ async fn generation_is_only_verified_by_generating() {
         return;
     };
 
-    let mut loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
 
     assert!(
-        !loaded
-            .instance()
+        !runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "loading must not verify generation"
     );
 
-    loaded
-        .verify_text_generation(&generation_request())
+    runtime
+        .verify_text_generation(&id, &generation_request())
         .await
         .expect("generates");
 
     assert!(
-        loaded
-            .instance()
+        runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "a successful generation should have verified the capability"
     );
     eprintln!(
         "text generation is now {}",
-        loaded
-            .instance()
+        runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .state(ModelCapability::TextGeneration)
     );
@@ -344,12 +357,16 @@ async fn generation_is_only_verified_by_generating() {
         ModelCapability::StructuredOutput,
     ] {
         assert!(
-            !loaded.instance().capabilities().is_verified(other),
+            !runtime
+                .instance(&id)
+                .expect("resident")
+                .capabilities()
+                .is_verified(other),
             "{other} was verified without being demonstrated"
         );
     }
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
@@ -357,7 +374,7 @@ async fn an_unusable_parameter_is_refused_before_reaching_a_backend() {
     use mehoy_core::inference::{GenerateTextRequest, GenerationParameters};
 
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -366,7 +383,7 @@ async fn an_unusable_parameter_is_refused_before_reaching_a_backend() {
         return;
     };
 
-    let loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
@@ -379,28 +396,31 @@ async fn an_unusable_parameter_is_refused_before_reaching_a_backend() {
             temperature: Some(-1.0),
             ..GenerationParameters::default()
         });
-    let err = loaded
-        .generate_text(&request)
+    let err = runtime
+        .generate_text(&id, &request)
         .await
         .expect_err("a negative temperature must be refused");
     assert!(
-        matches!(err, LoadError::InvalidRequest { .. }),
+        matches!(
+            err,
+            RuntimeError::Instance(LoadError::InvalidRequest { .. })
+        ),
         "expected InvalidRequest, got {err}"
     );
 
     // The instance is unharmed and still serves a valid request.
-    loaded
-        .generate_text(&generation_request())
+    runtime
+        .generate_text(&id, &generation_request())
         .await
         .expect("a valid request still works after a refused one");
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
 async fn a_reloaded_instance_has_not_generated_anything() {
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -409,34 +429,36 @@ async fn a_reloaded_instance_has_not_generated_anything() {
         return;
     };
 
-    let mut first = loader
+    let first = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
-    first
-        .verify_text_generation(&generation_request())
+    runtime
+        .verify_text_generation(&first, &generation_request())
         .await
         .expect("generates");
     assert!(
-        first
-            .instance()
+        runtime
+            .instance(&first)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration)
     );
-    first.unload().await.expect("unloads");
+    runtime.unload(&first).await.expect("unloads");
 
-    let second = loader
+    let second = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads again");
     assert!(
-        !second
-            .instance()
+        !runtime
+            .instance(&second)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "a new instance inherited a generation it never performed"
     );
-    second.unload().await.expect("unloads");
+    runtime.unload(&second).await.expect("unloads");
 }
 
 // ----------------------------------------------------------- streaming generation
@@ -494,7 +516,7 @@ async fn a_generative_model_actually_streams() {
     use mehoy_core::inference::FinishReason;
 
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -503,13 +525,13 @@ async fn a_generative_model_actually_streams() {
         return;
     };
 
-    let loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
 
-    let mut stream = loaded
-        .generate_stream(&generation_request())
+    let mut stream = runtime
+        .generate_stream(&id, &generation_request())
         .expect("the request is accepted")
         .stream;
 
@@ -542,7 +564,7 @@ async fn a_generative_model_actually_streams() {
         summary.finish_reason, summary.usage
     );
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
@@ -550,7 +572,7 @@ async fn a_stream_is_evidence_only_once_it_completes() {
     use mehoy_core::inference::GenerationEvent;
 
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -559,21 +581,22 @@ async fn a_stream_is_evidence_only_once_it_completes() {
         return;
     };
 
-    let mut loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
 
     assert!(
-        !loaded
-            .instance()
+        !runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "loading must not verify generation"
     );
 
-    let mut stream = loaded
-        .generate_stream(&generation_request())
+    let mut stream = runtime
+        .generate_stream(&id, &generation_request())
         .expect("the request is accepted")
         .stream;
 
@@ -598,25 +621,32 @@ async fn a_stream_is_evidence_only_once_it_completes() {
     assert!(stream.demonstrated_generation());
 
     assert!(
-        !loaded
-            .instance()
+        !runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "streaming must not verify anything until the outcome is recorded"
     );
 
-    assert!(loaded.record_generation_stream(&stream));
     assert!(
-        loaded
-            .instance()
+        runtime
+            .record_generation_stream(&id, &stream)
+            .expect("resident")
+    );
+    assert!(
+        runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .is_verified(ModelCapability::TextGeneration),
         "a completed stream should have verified the capability"
     );
     eprintln!(
         "text generation verified by streaming: {}",
-        loaded
-            .instance()
+        runtime
+            .instance(&id)
+            .expect("resident")
             .capabilities()
             .state(ModelCapability::TextGeneration)
     );
@@ -629,12 +659,16 @@ async fn a_stream_is_evidence_only_once_it_completes() {
         ModelCapability::StructuredOutput,
     ] {
         assert!(
-            !loaded.instance().capabilities().is_verified(other),
+            !runtime
+                .instance(&id)
+                .expect("resident")
+                .capabilities()
+                .is_verified(other),
             "{other} was verified without being demonstrated"
         );
     }
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
@@ -642,7 +676,7 @@ async fn both_delivery_modes_serve_the_same_request() {
     use mehoy_core::inference::FinishReason;
 
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -651,20 +685,20 @@ async fn both_delivery_modes_serve_the_same_request() {
         return;
     };
 
-    let loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
 
     // The same request type, the same parameters, one instance. Streaming is a
     // delivery choice rather than a different kind of work.
-    let whole = loaded
-        .generate_text(&generation_request())
+    let whole = runtime
+        .generate_text(&id, &generation_request())
         .await
         .expect("the model generates");
 
-    let mut stream = loaded
-        .generate_stream(&generation_request())
+    let mut stream = runtime
+        .generate_stream(&id, &generation_request())
         .expect("the request is accepted")
         .stream;
     let streamed = stream
@@ -695,7 +729,7 @@ async fn both_delivery_modes_serve_the_same_request() {
         whole.text, whole.finish_reason, streamed.text, streamed.finish_reason
     );
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
@@ -703,7 +737,7 @@ async fn a_stream_is_refused_before_reaching_a_backend_when_a_parameter_is_unusa
     use mehoy_core::inference::{GenerateTextRequest, GenerationParameters};
 
     let _exclusive = exclusive().await;
-    let Some(loader) = loader() else { return };
+    let Some(runtime) = runtime() else { return };
     let Some((registry, artifacts)) = survey() else {
         return;
     };
@@ -712,7 +746,7 @@ async fn a_stream_is_refused_before_reaching_a_backend_when_a_parameter_is_unusa
         return;
     };
 
-    let loaded = loader
+    let id = runtime
         .load(&registry, &artifact.id, worker_id(), deadlines())
         .await
         .expect("loads");
@@ -723,8 +757,8 @@ async fn a_stream_is_refused_before_reaching_a_backend_when_a_parameter_is_unusa
         ..GenerationParameters::default()
     });
 
-    match loaded.generate_stream(&request) {
-        Err(LoadError::InvalidRequest { detail }) => {
+    match runtime.generate_stream(&id, &request) {
+        Err(RuntimeError::Instance(LoadError::InvalidRequest { detail })) => {
             assert!(
                 detail.contains("temperature"),
                 "unexpected detail: {detail}"
@@ -734,5 +768,5 @@ async fn a_stream_is_refused_before_reaching_a_backend_when_a_parameter_is_unusa
         Ok(_) => panic!("an unusable temperature opened a stream"),
     }
 
-    loaded.unload().await.expect("unloads");
+    runtime.unload(&id).await.expect("unloads");
 }

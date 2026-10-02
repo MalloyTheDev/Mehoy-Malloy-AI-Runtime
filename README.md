@@ -55,14 +55,20 @@ artifact format, one model at a time.
 - Unloading an instance: admission closes first, outstanding requests are stopped
   through that same machinery, they are given a bounded time to settle, and only
   then is the worker taken away
+- Runtime ownership of live models. Loading yields an identifier and the runtime
+  keeps the model; nothing hands one out, so every operation is addressed by name
+  and goes through admission. One model may be resident at a time, refused
+  explicitly rather than by nothing having been written yet
 
 **Not implemented**
 
 - Observing that a backend has actually stopped. The runtime knows it released the
   request's transport; whether the engine then stops promptly is a property of the
   engine, measured per build rather than guaranteed here
-- Concurrency limits and queueing. Requests have identity, which is what those
-  would need, and neither exists
+- Concurrency limits and queueing. Requests and instances both have identity now,
+  which is what those would need, and neither exists
+- More than one resident model, and therefore any resource accounting that would
+  have to decide between them
 - Conversation input. Continuation is the primitive; a conversation shape arrives
   when something can render a template for it
 - Any model class beyond text embeddings and text generation. Nothing prevents them;

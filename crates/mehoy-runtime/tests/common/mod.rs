@@ -17,7 +17,7 @@ use mehoy_backend_llama::{EXECUTABLE_ENV, LlamaCppBackend, ModelDescriptor};
 use mehoy_core::id::{IdAllocator, WorkerId};
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::{ArtifactRegistry, ModelArtifact};
-use mehoy_runtime::ModelLoader;
+use mehoy_runtime::Runtime;
 
 pub fn worker_id() -> WorkerId {
     static IDS: std::sync::LazyLock<IdAllocator> = std::sync::LazyLock::new(IdAllocator::new);
@@ -116,12 +116,30 @@ pub fn embedding_artifact(artifacts: &[ModelArtifact]) -> Option<&ModelArtifact>
         .find(|artifact| compatibility::launch_mode(&describe(artifact)) == LaunchMode::Embedding)
 }
 
-pub fn loader() -> Option<ModelLoader> {
+pub fn runtime() -> Option<Runtime> {
     match LlamaCppBackend::from_env() {
-        Ok(backend) => Some(ModelLoader::new(backend)),
+        Ok(backend) => Some(Runtime::new(backend)),
         Err(err) => {
             eprintln!("SKIPPED: no backend available ({err}). Set {EXECUTABLE_ENV} to run.");
             None
         }
     }
+}
+
+/// Loads the one generative container on this machine, or explains the skip.
+///
+/// Returns the runtime alongside the identifier, because the runtime owns the
+/// model: letting it drop would take the instance with it.
+pub async fn loaded_generative() -> Option<(Runtime, ArtifactRegistry, mehoy_runtime::InstanceId)> {
+    let runtime = runtime()?;
+    let (registry, artifacts) = survey()?;
+    let Some(artifact) = generative_artifact(&artifacts) else {
+        eprintln!("SKIPPED: no text-generative container found on this machine");
+        return None;
+    };
+    let id = runtime
+        .load(&registry, &artifact.id, worker_id(), deadlines())
+        .await
+        .expect("loads");
+    Some((runtime, registry, id))
 }
