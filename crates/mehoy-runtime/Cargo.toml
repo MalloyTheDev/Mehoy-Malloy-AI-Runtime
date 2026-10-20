@@ -49,5 +49,12 @@ required-features = ["real-backend-tests"]
 name = "ownership"
 required-features = ["real-backend-tests"]
 
+# The accounting policy is unit-tested in the library and runs on every commit.
+# This target covers only what joining it to a real load establishes, so it needs
+# a model to load.
+[[test]]
+name = "accounting"
+required-features = ["real-backend-tests"]
+
 [lints]
 workspace = true

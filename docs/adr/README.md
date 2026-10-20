@@ -22,6 +22,7 @@ Evidence labels follow the project claim discipline used elsewhere in `docs/`:
 | [0007](0007-chat-is-not-the-inference-primitive.md) | Chat is an application abstraction, not the inference primitive | Accepted |
 | [0008](0008-minimal-portable-generation-parameters.md) | Only portable generation parameters are normalised | Accepted |
 | [0009](0009-the-runtime-owns-requests-not-streams.md) | The runtime owns requests, and a stream is only how one is observed | Accepted |
+| [0010](0010-resource-accounting-is-declared-not-measured.md) | Resource accounting is declared by the artifact, not measured on the machine | Accepted |
 
 ## Open decisions
 
@@ -37,6 +38,8 @@ Recorded here so they are not lost between records.
 | How backend-native controls are reached without joining the portable parameter set | No, not needed to generate text | [0008](0008-minimal-portable-generation-parameters.md) |
 | Concurrency limits and queueing, now that requests have identity | No, nothing queues yet | [0009](0009-the-runtime-owns-requests-not-streams.md) |
 | Whether the runtime should observe that a backend actually stopped, rather than only that its transport was released | No, measured per backend for now | [0009](0009-the-runtime-owns-requests-not-streams.md) |
+| How a model's real footprint is measured, as distinct from the figure its container declares | Needed before more than one model may usefully be resident | [0010](0010-resource-accounting-is-declared-not-measured.md) |
+| What happens when several resident models compete, which is eviction, per-instance concurrency and scheduling | No, more than one is expressible but nothing arbitrates between them | [0010](0010-resource-accounting-is-declared-not-measured.md) |
 
 ## Resolved since being raised
 

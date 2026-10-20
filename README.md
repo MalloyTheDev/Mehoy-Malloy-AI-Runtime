@@ -14,7 +14,7 @@ Early, and it performs real inference.
 One complete lifecycle works end to end: a GGUF container is registered, loaded onto
 a supervised backend, asked to embed or to generate, streamed incrementally,
 cancelled by identity, and unloaded so that nothing survives it. One backend, one
-artifact format, one model at a time.
+artifact format, and by default one model at a time.
 
 **Implemented**
 
@@ -57,8 +57,14 @@ artifact format, one model at a time.
   then is the worker taken away
 - Runtime ownership of live models. Loading yields an identifier and the runtime
   keeps the model; nothing hands one out, so every operation is addressed by name
-  and goes through admission. One model may be resident at a time, refused
-  explicitly rather than by nothing having been written yet
+  and goes through admission
+- A stated limit on what the runtime will hold, and accounting against it. How
+  many models, and optionally how many bytes of weights, are configured when the
+  runtime is built. Every load claims room before the expensive part and gives it
+  back however the load ends, so the limit holds for two loads arriving at once
+  and not only for callers who arrive one at a time. Every figure is declared by
+  the container rather than measured on the machine, and records which it is. See
+  [ADR-0010](docs/adr/0010-resource-accounting-is-declared-not-measured.md)
 
 **Not implemented**
 
@@ -67,8 +73,14 @@ artifact format, one model at a time.
   engine, measured per build rather than guaranteed here
 - Concurrency limits and queueing. Requests and instances both have identity now,
   which is what those would need, and neither exists
-- More than one resident model, and therefore any resource accounting that would
-  have to decide between them
+- Any measurement of what a model actually costs. A footprint is the size of the
+  container on disk, which is a floor rather than a total: it excludes the
+  key/value cache, the backend's buffers and the backend process, and says
+  nothing about this host or its accelerators. Fitting the stated limits is not
+  evidence of fitting the hardware
+- Arbitration between resident models. More than one is expressible now, but
+  nothing evicts one, chooses between them for an accelerator, or schedules with
+  any regard for memory, so the default stays at one
 - Conversation input. Continuation is the primitive; a conversation shape arrives
   when something can render a template for it
 - Any model class beyond text embeddings and text generation. Nothing prevents them;
@@ -76,7 +88,6 @@ artifact format, one model at a time.
 - Taking ownership of an artifact into a managed store. Registration records where
   a file is; it never copies or moves it
 - Backend installation or download. The executable is configured explicitly
-- Memory-aware scheduling
 - Any vendor-compatible endpoint
 
 **Known limitations**
@@ -179,13 +190,19 @@ first is expected to pass on every machine and every commit.
 
 The default gate covers this runtime's own behaviour, including every failure path
 of streaming and cancellation, against servers that misbehave on request. Nothing
-in it loads a model.
+in it requires a model: the few targets that can use one skip, and say so, when
+no backend executable is configured, so on a machine without one the gate is
+entirely deterministic.
 
 The real-backend gate covers what a particular engine build actually does: that a
 model loads and generates, and that stopping a request stops the work rather than
 merely stopping the output. Those are properties of that engine rather than of this
-code, which is why they are opt-in. The test targets are not built without their
-feature, so they cost the default gate nothing.
+code, which is why they are opt-in. It also holds the tests about this runtime's
+own behaviour that need a real model in order to have something to be about, such
+as ownership and resource accounting; the policy those enforce is unit-tested in
+the default gate, and only the joining of it to an actual load lives here. The
+test targets are not built without their feature, so they cost the default gate
+nothing.
 
 ```bash
 MEHOY_LLAMA_SERVER=/path/to/llama-server cargo test --workspace \

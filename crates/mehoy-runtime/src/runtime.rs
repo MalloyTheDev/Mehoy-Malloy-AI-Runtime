@@ -15,9 +15,9 @@
 //!
 //! # Two locks, deliberately
 //!
-//! The registry lock resolves an identifier to an instance and is released
+//! The ledger lock resolves an identifier to an instance and is released
 //! immediately. The instance's own lifecycle lock decides whether the request is
-//! admitted. Merging them into one lock would mean holding the registry across
+//! admitted. Merging them into one lock would mean holding the ledger across
 //! inference, cancellation, draining and process teardown, which would make every
 //! other caller wait on whatever one instance happened to be doing.
 //!
@@ -27,8 +27,19 @@
 //! wins: either the request is registered and unloading finds it, or admission
 //! has closed and the request is refused. There is no interleaving in which a
 //! request reaches a backend that is being torn down.
+//!
+//! # A limit is claimed, not merely checked
+//!
+//! The one race the ledger lock does own is between two loads. Checking a limit
+//! and then spending a minute bringing a model up would let two concurrent loads
+//! both pass a check that only one of them can satisfy, and the second would
+//! discover this only after the expensive part was already done. So a load takes
+//! a reservation under the ledger lock before it starts and holds it until the
+//! model is either resident or gone. A load in flight is accounted for exactly as
+//! a resident model is, because the memory is being taken either way.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -48,14 +59,7 @@ use crate::loader::{
     CancelError, CancelOutcome, GenerationRequest, LifecyclePhase, LoadError, LoadedModel,
     ModelLoader, UnloadOutcome,
 };
-
-/// How many models may be resident at once.
-///
-/// One, stated rather than implied. The registry is keyed by identifier and could
-/// hold more, so without this the limit would be an accident of nothing having
-/// been written yet. Lifting it means deciding what happens when two models
-/// compete for one accelerator, which is resource accounting and does not exist.
-pub const RESIDENT_CAPACITY: usize = 1;
+use crate::resources::{Refusal, ResidentLimits, ResidentUsage, ResourceFootprint};
 
 /// Why a runtime operation could not be carried out.
 #[derive(Debug)]
@@ -67,8 +71,21 @@ pub enum RuntimeError {
     /// and an identifier is not reused, so a stale one can never reach a later
     /// model.
     UnknownInstance { instance: InstanceId },
-    /// Another model is already resident.
+    /// This runtime already holds as many models as it will.
+    ///
+    /// Counts loads in flight, so a second caller is refused while the first is
+    /// still bringing its model up rather than after.
     ResidentCapacityReached { capacity: usize },
+    /// The model's accounted weights do not fit this runtime's byte budget.
+    ///
+    /// Every figure is declared rather than measured: see
+    /// [`crate::resources`]. A refusal here means the stated policy would be
+    /// exceeded, not that the hardware would be.
+    ResourcesExhausted {
+        requested: u64,
+        committed: u64,
+        limit: u64,
+    },
     /// The operation itself failed.
     Instance(LoadError),
     /// The request could not be cancelled.
@@ -85,6 +102,26 @@ impl std::fmt::Display for RuntimeError {
                 f,
                 "this runtime holds at most {capacity} resident model(s); unload one first"
             ),
+            Self::ResourcesExhausted {
+                requested,
+                committed,
+                limit,
+            } => {
+                if requested > limit {
+                    write!(
+                        f,
+                        "this model is accounted at {requested} byte(s) of weights, more than the \
+                         whole {limit} byte budget, so it will not fit here however much is \
+                         unloaded first"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "this model is accounted at {requested} byte(s) of weights and \
+                         {committed} of {limit} are already committed; unload something first"
+                    )
+                }
+            }
             Self::Instance(err) => write!(f, "{err}"),
             Self::Cancel(err) => write!(f, "{err}"),
         }
@@ -113,6 +150,144 @@ impl From<CancelError> for RuntimeError {
     }
 }
 
+impl RuntimeError {
+    /// Translates a policy refusal into this layer's own vocabulary.
+    ///
+    /// Exhaustive on purpose: a new limit forces this to be updated rather than
+    /// silently collapsing into an existing message.
+    fn from_refusal(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::Instances { capacity } => Self::ResidentCapacityReached { capacity },
+            Refusal::WeightBytes {
+                requested,
+                committed,
+                limit,
+            } => Self::ResourcesExhausted {
+                requested,
+                committed,
+                limit,
+            },
+        }
+    }
+}
+
+/// Identifies one load in flight.
+///
+/// Internal and short lived: it exists only so a reservation can be released
+/// again, and it is gone once the load has either produced a model or failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ReservationId(u64);
+
+/// A model this runtime holds, and what it is accounted for.
+///
+/// One entry rather than two maps, so releasing a model and releasing what it
+/// occupied cannot come apart. There is no code path that forgets one and not the
+/// other, because there is only one thing to forget.
+#[derive(Debug)]
+struct Resident {
+    model: Arc<LoadedModel>,
+    footprint: ResourceFootprint,
+}
+
+/// Everything committed against this runtime's limits.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// Loads in flight, which have claimed a limit but have no model yet.
+    pending: HashMap<ReservationId, ResourceFootprint>,
+    resident: HashMap<InstanceId, Resident>,
+    next_reservation: u64,
+}
+
+impl Ledger {
+    /// What is committed right now, loads in flight included.
+    fn committed(&self) -> ResidentUsage {
+        let weight_bytes = self
+            .pending
+            .values()
+            .chain(self.resident.values().map(|entry| &entry.footprint))
+            // Saturating, which errs towards refusing. A total that saturated
+            // would have to come from exabytes of containers, and reporting the
+            // maximum is the safe direction to be wrong in.
+            .fold(0u64, |total, footprint| {
+                total.saturating_add(footprint.weight_bytes)
+            });
+        ResidentUsage {
+            instances: self.pending.len().saturating_add(self.resident.len()),
+            loading: self.pending.len(),
+            weight_bytes,
+        }
+    }
+
+    fn allocate(&mut self) -> ReservationId {
+        self.next_reservation = self.next_reservation.wrapping_add(1);
+        ReservationId(self.next_reservation)
+    }
+}
+
+/// A claim on this runtime's limits, held for the whole of one load.
+///
+/// Released when it is dropped, which is what makes every way a load can fail
+/// release it: an early return, an error from the backend, or a panic unwinding
+/// through the load. The alternative, releasing explicitly on each failure path,
+/// is one path away from leaking a limit that nothing will ever give back.
+struct Reserved<'a> {
+    runtime: &'a Runtime,
+    id: ReservationId,
+    /// Set once the claim has been turned into a resident model, so dropping the
+    /// guard afterwards does not release what is now held for real.
+    settled: bool,
+}
+
+impl Reserved<'_> {
+    /// Turns the claim into a resident model and reports its identifier.
+    ///
+    /// # Errors
+    ///
+    /// Hands the model back, with an account of why, when the runtime cannot take
+    /// it. The caller is then the only party able to stop the worker it just
+    /// started.
+    fn fulfil(mut self, model: LoadedModel) -> Result<InstanceId, Box<(String, LoadedModel)>> {
+        let runtime = self.runtime;
+        let id = model.instance_id();
+        let mut ledger = runtime.ledger();
+
+        let Some(footprint) = ledger.pending.remove(&self.id) else {
+            // Unreachable: this consumes the reservation, so it is settled once.
+            self.settled = true;
+            return Err(Box::new((
+                "the reservation this load was admitted under had already been released".to_owned(),
+                model,
+            )));
+        };
+        self.settled = true;
+
+        match ledger.resident.entry(id.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(Resident {
+                    model: Arc::new(model),
+                    footprint,
+                });
+                Ok(id)
+            }
+            // Unreachable in practice: an identifier is 96 random bits. Refused
+            // rather than inserted anyway, because inserting would drop a live
+            // model whose worker nothing would then stop.
+            Entry::Occupied(_) => Err(Box::new((
+                format!("instance {id} is already resident"),
+                model,
+            ))),
+        }
+    }
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.runtime.ledger().pending.remove(&self.id);
+        }
+    }
+}
+
 /// Owns every live model.
 ///
 /// Models are addressed by [`InstanceId`] and never handed out. A caller cannot
@@ -121,16 +296,57 @@ impl From<CancelError> for RuntimeError {
 #[derive(Debug)]
 pub struct Runtime {
     loader: ModelLoader,
-    resident: Mutex<HashMap<InstanceId, Arc<LoadedModel>>>,
+    /// Stated once, when the runtime is built, and never changed afterwards.
+    ///
+    /// A limit that could move while loads were being judged against it would
+    /// make a refusal unexplainable, so changing what this runtime will hold
+    /// means building one that holds it.
+    limits: ResidentLimits,
+    ledger: Mutex<Ledger>,
 }
 
 impl Runtime {
+    /// A runtime with the default limits.
+    ///
+    /// See [`ResidentLimits::default`]: one model, no byte budget.
     #[must_use]
     pub fn new(backend: LlamaCppBackend) -> Self {
+        Self::with_limits(backend, ResidentLimits::default())
+    }
+
+    /// A runtime that will hold what `limits` says.
+    #[must_use]
+    pub fn with_limits(backend: LlamaCppBackend, limits: ResidentLimits) -> Self {
         Self {
             loader: ModelLoader::new(backend),
-            resident: Mutex::new(HashMap::new()),
+            limits,
+            ledger: Mutex::new(Ledger::default()),
         }
+    }
+
+    /// What this runtime will hold.
+    #[must_use]
+    pub fn limits(&self) -> ResidentLimits {
+        self.limits
+    }
+
+    /// What this runtime currently holds against those limits.
+    ///
+    /// Includes loads in flight, so the figures are what the next load will be
+    /// judged against rather than a count of finished work.
+    #[must_use]
+    pub fn usage(&self) -> ResidentUsage {
+        self.ledger().committed()
+    }
+
+    /// What one resident model is accounted as occupying.
+    ///
+    /// The figure a load was admitted under. It does not change afterwards:
+    /// nothing re-measures a running model, and a number that drifted would make
+    /// the accounting impossible to reason about.
+    #[must_use]
+    pub fn footprint(&self, id: &InstanceId) -> Option<ResourceFootprint> {
+        self.ledger().resident.get(id).map(|entry| entry.footprint)
     }
 
     /// Brings a registered artifact up and keeps it.
@@ -141,9 +357,10 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::ResidentCapacityReached`] when a model is already
-    /// resident, and [`RuntimeError::Instance`] when the artifact cannot be
-    /// brought up.
+    /// Returns [`RuntimeError::ResidentCapacityReached`] or
+    /// [`RuntimeError::ResourcesExhausted`] when this runtime will not hold the
+    /// model, and [`RuntimeError::Instance`] when the artifact cannot be brought
+    /// up. A refused or failed load leaves nothing committed.
     pub async fn load(
         &self,
         registry: &ArtifactRegistry,
@@ -151,19 +368,38 @@ impl Runtime {
         worker: WorkerId,
         deadlines: Deadlines,
     ) -> Result<InstanceId, RuntimeError> {
-        // Checked before the work rather than after it. Starting a multi-gigabyte
-        // load and then refusing to keep it would waste the expensive part.
-        self.admit_resident()?;
+        // Sized before the limit is claimed, so an artifact this runtime has
+        // never heard of is refused without disturbing the accounting at all.
+        let footprint = declared_footprint(registry, artifact)?;
+
+        // Claimed before the work rather than checked before it. Starting a
+        // multi-gigabyte load and then refusing to keep it would waste the
+        // expensive part, and checking without claiming would let a second
+        // concurrent load pass the same check.
+        let reserved = self.reserve(footprint)?;
 
         let loaded = self
             .loader
             .load(registry, artifact, worker, deadlines)
             .await?;
-        let id = loaded.instance_id();
 
-        let mut resident = self.resident();
-        resident.insert(id.clone(), Arc::new(loaded));
-        Ok(id)
+        match reserved.fulfil(loaded) {
+            Ok(id) => Ok(id),
+            Err(rejected) => {
+                let (reason, model) = *rejected;
+                // A model the runtime will not take is a model nothing else can
+                // reach, and its worker is holding memory. Stopping it here is the
+                // only opportunity anything has to do so.
+                let reason = match model.unload_within(UnloadBudget::default()).await {
+                    Ok(_) => reason,
+                    Err(err) => format!(
+                        "{reason}; the backend could not be stopped afterwards and may still be \
+                         running: {err}"
+                    ),
+                };
+                Err(RuntimeError::Instance(LoadError::Instance { reason }))
+            }
+        }
     }
 
     /// What is known about a resident instance.
@@ -179,7 +415,7 @@ impl Runtime {
     /// Every resident instance, in no particular order.
     #[must_use]
     pub fn resident_instances(&self) -> Vec<InstanceId> {
-        self.resident().keys().cloned().collect()
+        self.ledger().resident.keys().cloned().collect()
     }
 
     /// Whether a resident instance is still serving.
@@ -372,19 +608,27 @@ impl Runtime {
 
         match &outcome {
             Ok(_) if model.phase() == LifecyclePhase::Unloaded => {
-                self.resident().remove(id);
+                // Removing the entry releases what the model was accounted for,
+                // because the two are one entry.
+                self.ledger().resident.remove(id);
             }
             // A teardown that did not finish keeps its entry, so what is left can
-            // still be named and asked about.
+            // still be named and asked about, and stays accounted for. A worker
+            // that could not be stopped may still be holding its memory, and
+            // handing that budget to another model would be the more dangerous of
+            // the two wrong answers.
             _ => {}
         }
 
         Ok(outcome?)
     }
 
-    /// Resolves an identifier, releasing the registry lock immediately.
+    /// Resolves an identifier, releasing the ledger lock immediately.
     fn resolve(&self, id: &InstanceId) -> Option<Arc<LoadedModel>> {
-        self.resident().get(id).map(Arc::clone)
+        self.ledger()
+            .resident
+            .get(id)
+            .map(|entry| Arc::clone(&entry.model))
     }
 
     fn require(&self, id: &InstanceId) -> Result<Arc<LoadedModel>, RuntimeError> {
@@ -394,21 +638,48 @@ impl Runtime {
             })
     }
 
-    /// Refuses a load that would exceed what this runtime will hold.
-    fn admit_resident(&self) -> Result<(), RuntimeError> {
-        let resident = self.resident();
-        if resident.len() >= RESIDENT_CAPACITY {
-            return Err(RuntimeError::ResidentCapacityReached {
-                capacity: RESIDENT_CAPACITY,
-            });
-        }
-        Ok(())
+    /// Claims room for one model, or refuses it.
+    ///
+    /// Deciding and recording happen under one lock, so two concurrent loads
+    /// cannot both be told there is room for one.
+    fn reserve(&self, footprint: ResourceFootprint) -> Result<Reserved<'_>, RuntimeError> {
+        let mut ledger = self.ledger();
+        self.limits
+            .admits(ledger.committed(), footprint)
+            .map_err(RuntimeError::from_refusal)?;
+        let id = ledger.allocate();
+        ledger.pending.insert(id, footprint);
+        Ok(Reserved {
+            runtime: self,
+            id,
+            settled: false,
+        })
     }
 
-    fn resident(&self) -> MutexGuard<'_, HashMap<InstanceId, Arc<LoadedModel>>> {
+    fn ledger(&self) -> MutexGuard<'_, Ledger> {
         // Never held across an await. Every slow operation happens after the
         // guard has been dropped, which is what keeps one instance's teardown
         // from blocking access to another.
-        self.resident.lock().unwrap_or_else(PoisonError::into_inner)
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// What a registered artifact is accounted as needing.
+///
+/// Read here rather than taken from the loader, because the limit has to be
+/// claimed before the expensive work and the loader does not return until that
+/// work is done. The loader resolves the artifact again and confirms it has not
+/// drifted immediately before starting a worker, which is where that check
+/// belongs: a file can be replaced between the two, and the one that matters is
+/// the one taken immediately before use.
+fn declared_footprint(
+    registry: &ArtifactRegistry,
+    artifact: &ArtifactId,
+) -> Result<ResourceFootprint, LoadError> {
+    let record = registry
+        .get(artifact)?
+        .ok_or_else(|| LoadError::UnknownArtifact {
+            id: artifact.clone(),
+        })?;
+    Ok(ResourceFootprint::from_container_size(record.size_bytes))
 }

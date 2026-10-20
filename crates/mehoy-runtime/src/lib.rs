@@ -24,10 +24,19 @@
 //! every operation going through admission, and therefore visible to teardown.
 //! The loader that builds instances is deliberately not public, so there is one
 //! way to have a live model rather than two.
+//!
+//! # How much it will own
+//!
+//! Stated by [`resources::ResidentLimits`] when the runtime is built, and
+//! enforced on every load. The figures a model is accounted at are declared by
+//! its artifact rather than measured on the machine, which [`resources`] is
+//! explicit about: the accounting enforces a policy somebody chose, and is not
+//! evidence that the hardware can take it.
 
 pub mod capability;
 pub mod instance;
 mod loader;
+pub mod resources;
 pub mod runtime;
 
 pub use capability::{CapabilityEvidence, CapabilityState, ModelCapabilities, ModelCapability};
@@ -35,7 +44,10 @@ pub use instance::{InstanceFailure, InstanceId, InstanceState, ModelInstance};
 pub use loader::{
     CancelError, CancelOutcome, GenerationRequest, LifecyclePhase, LoadError, UnloadOutcome,
 };
-pub use runtime::{RESIDENT_CAPACITY, Runtime, RuntimeError};
+pub use resources::{
+    DEFAULT_RESIDENT_CAPACITY, FootprintBasis, ResidentLimits, ResidentUsage, ResourceFootprint,
+};
+pub use runtime::{Runtime, RuntimeError};
 
 #[cfg(feature = "fault-injection")]
 pub use loader::{clear_injected_faults, fail_next_commit};

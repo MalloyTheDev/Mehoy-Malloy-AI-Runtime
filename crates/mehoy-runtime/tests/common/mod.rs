@@ -17,7 +17,7 @@ use mehoy_backend_llama::{EXECUTABLE_ENV, LlamaCppBackend, ModelDescriptor};
 use mehoy_core::id::{IdAllocator, WorkerId};
 use mehoy_core::worker::Deadlines;
 use mehoy_registry::{ArtifactRegistry, ModelArtifact};
-use mehoy_runtime::Runtime;
+use mehoy_runtime::{ResidentLimits, Runtime};
 
 pub fn worker_id() -> WorkerId {
     static IDS: std::sync::LazyLock<IdAllocator> = std::sync::LazyLock::new(IdAllocator::new);
@@ -117,8 +117,13 @@ pub fn embedding_artifact(artifacts: &[ModelArtifact]) -> Option<&ModelArtifact>
 }
 
 pub fn runtime() -> Option<Runtime> {
+    runtime_with_limits(ResidentLimits::default())
+}
+
+/// A runtime that will hold what `limits` says, or an explained skip.
+pub fn runtime_with_limits(limits: ResidentLimits) -> Option<Runtime> {
     match LlamaCppBackend::from_env() {
-        Ok(backend) => Some(Runtime::new(backend)),
+        Ok(backend) => Some(Runtime::with_limits(backend, limits)),
         Err(err) => {
             eprintln!("SKIPPED: no backend available ({err}). Set {EXECUTABLE_ENV} to run.");
             None

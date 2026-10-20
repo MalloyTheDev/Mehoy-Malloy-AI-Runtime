@@ -13,7 +13,7 @@ use std::time::Duration;
 use mehoy_core::inference::{EmbedRequest, GenerateTextRequest, GenerationParameters};
 use mehoy_registry::ArtifactRegistry;
 use mehoy_runtime::{
-    InstanceId, LifecyclePhase, LoadError, ModelCapability, RESIDENT_CAPACITY, Runtime,
+    DEFAULT_RESIDENT_CAPACITY, InstanceId, LifecyclePhase, LoadError, ModelCapability, Runtime,
     RuntimeError,
 };
 
@@ -168,7 +168,7 @@ async fn a_second_resident_model_is_refused_rather_than_loaded() {
         .await
     {
         Err(RuntimeError::ResidentCapacityReached { capacity }) => {
-            assert_eq!(capacity, RESIDENT_CAPACITY);
+            assert_eq!(capacity, DEFAULT_RESIDENT_CAPACITY);
         }
         Err(other) => panic!("expected a capacity refusal, got {other}"),
         Ok(_) => panic!("a second model was loaded while one was already resident"),
