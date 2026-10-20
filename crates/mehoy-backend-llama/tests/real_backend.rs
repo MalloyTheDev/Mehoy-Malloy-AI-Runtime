@@ -140,7 +140,8 @@ async fn the_backend_is_never_told_to_bind_a_routable_address() {
     assert!(args.contains(&"--no-webui".to_owned()));
     assert!(
         !args.iter().any(|arg| arg == channel.secret().expose()),
-        "the credential must never appear in the process arguments, which other          local accounts can read"
+        "the credential must never appear in the process arguments, which other \
+         local accounts can read"
     );
 }
 

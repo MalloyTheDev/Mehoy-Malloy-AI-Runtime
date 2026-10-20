@@ -813,7 +813,8 @@ impl ModelLoader {
                 let reason = match backend.stop().await {
                     Ok(()) => reason,
                     Err(err) => format!(
-                        "{reason}; the backend could not be stopped afterwards and may still                          be running: {err}"
+                        "{reason}; the backend could not be stopped afterwards and may still \
+                         be running: {err}"
                     ),
                 };
                 Err(LoadError::Instance { reason })

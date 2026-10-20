@@ -37,7 +37,8 @@ fn example_binary(name: &str) -> Option<PathBuf> {
 fn example(name: &str) -> PathBuf {
     example_binary(name).unwrap_or_else(|| {
         panic!(
-            "example {name} was not built; cargo builds examples during `cargo test`,              so this means the example target is missing"
+            "example {name} was not built; cargo builds examples during `cargo test`, \
+             so this means the example target is missing"
         )
     })
 }

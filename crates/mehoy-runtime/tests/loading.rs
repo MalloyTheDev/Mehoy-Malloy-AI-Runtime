@@ -122,7 +122,8 @@ fn backend_process_count() -> usize {
     // real backends. That produced a test that failed for reasons having nothing
     // to do with what it was checking.
     let script = format!(
-        "(Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" |          Where-Object {{ $_.ParentProcessId -eq {} }} | Measure-Object).Count",
+        "(Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | \
+         Where-Object {{ $_.ParentProcessId -eq {} }} | Measure-Object).Count",
         std::process::id()
     );
     std::process::Command::new("powershell")

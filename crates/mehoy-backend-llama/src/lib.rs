@@ -406,7 +406,8 @@ impl LlamaCppBackend {
                         let left_running = ProcessWorker.shutdown(&mut handle).await.err();
                         Err(BackendError::Rejected {
                             detail: format!(
-                                "the backend refused the runtime's own credential with status                                  {status}; it is serving but unusable{}",
+                                "the backend refused the runtime's own credential with status \
+                                 {status}; it is serving but unusable{}",
                                 describe_leak(left_running.as_ref())
                             ),
                         })
