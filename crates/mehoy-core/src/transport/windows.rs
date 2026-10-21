@@ -228,6 +228,40 @@ impl std::fmt::Debug for Endpoint {
     }
 }
 
+impl Drop for Endpoint {
+    /// Records that the endpoint is being torn down.
+    ///
+    /// Nothing is released here: closing the pending instance is the handle's own
+    /// `Drop`, and there is no file to unlink as there is on Unix. The event is
+    /// the point. [`Stage::EndpointClosed`] is documented as the moment a
+    /// listening endpoint was torn down, the Unix path emits it, and this one did
+    /// not, so a trace of a named pipe's life recorded everything up to the last
+    /// accept and then simply stopped.
+    ///
+    /// That matters because the question asked of such a trace is an ordering
+    /// one: whether this endpoint went away before something else tried to bind
+    /// the same name. Without this event, one side of that comparison does not
+    /// exist at all.
+    ///
+    /// Read it as "teardown began" and not as "the handle is closed". Rust runs
+    /// this before dropping the fields, so the pending instance outlives the
+    /// event by a moment, and the Unix path emits its own before unlinking for
+    /// the same reason. Moving it after the close would mean holding the listener
+    /// in an `Option` purely to be able to take it, and the two platforms
+    /// disagreeing about what the event means would cost more than the precision
+    /// is worth. What the trace can still settle is the case that needs no
+    /// precision: an address whose failing bind shows no close event at all was
+    /// never torn down.
+    fn drop(&mut self) {
+        trace::emit(&EndpointEvent::new(
+            Stage::EndpointClosed,
+            &self.trace_address,
+            self.generation,
+            self.pending.is_some(),
+        ));
+    }
+}
+
 impl Endpoint {
     /// Creates the pipe with a descriptor restricting it to the current user.
     ///

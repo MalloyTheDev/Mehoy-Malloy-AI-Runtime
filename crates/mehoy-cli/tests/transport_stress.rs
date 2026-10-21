@@ -18,6 +18,7 @@
 //! operating system error and the listener state at the moment it happened,
 //! instead of a flattened error kind.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -28,6 +29,50 @@ use mehoy_protocol::HealthStatus;
 
 /// Accept failures and missing-listener observations seen during a run.
 static ANOMALIES: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+
+/// Every event, kept per address.
+///
+/// The anomaly list above is one stage across every address, which answers the
+/// question these tests ask continuously. It cannot answer the other one: why a
+/// single endpoint misbehaved. That needs the whole lifecycle of one address, in
+/// order, because the interesting sequence is when its instances were created,
+/// when it was closed, and what the next bind found still listening.
+static TRACES: OnceLock<Mutex<HashMap<String, VecDeque<String>>>> = OnceLock::new();
+
+/// How much of one address's history is kept.
+///
+/// A storm test produces thousands of events and only the tail explains a
+/// failure, so this is bounded for the same reason the worker log is.
+const TRACE_DEPTH: usize = 400;
+
+fn traces() -> &'static Mutex<HashMap<String, VecDeque<String>>> {
+    TRACES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record(event: &EndpointEvent) {
+    if let Ok(mut guard) = traces().lock() {
+        let history = guard.entry(event.address.to_string()).or_default();
+        if history.len() == TRACE_DEPTH {
+            history.pop_front();
+        }
+        history.push_back(event.to_string());
+    }
+}
+
+/// One address's recorded history, oldest first and indented for a panic message.
+fn trace_for(address: &EndpointAddress) -> String {
+    let Ok(guard) = traces().lock() else {
+        return "    (the trace lock was poisoned)".to_owned();
+    };
+    match guard.get(address.as_str()) {
+        Some(history) if !history.is_empty() => history
+            .iter()
+            .map(|event| format!("    {event}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => "    (nothing was recorded for this address)".to_owned(),
+    }
+}
 
 fn anomalies() -> Arc<Mutex<Vec<String>>> {
     Arc::clone(ANOMALIES.get_or_init(|| Arc::new(Mutex::new(Vec::new()))))
@@ -41,7 +86,11 @@ fn install_observer() {
         // A second observer cannot be installed, which is fine: the first one wins
         // and this binary only installs this one.
         let _ = mehoy_core::transport::set_observer(move |event: &EndpointEvent| {
-            // Only accept-time problems matter here. A failed *bind* is an
+            // Everything, keyed by address, so a failure on one endpoint can be
+            // explained rather than merely reported.
+            record(event);
+
+            // Only accept-time problems count as anomalies. A failed *bind* is an
             // expected, recoverable step while a previous endpoint finishes
             // tearing down, and other tests bind concurrently through the same
             // process-wide observer.
@@ -94,9 +143,18 @@ struct RunningDaemon {
 
 impl RunningDaemon {
     async fn start(address: &EndpointAddress) -> Self {
-        let endpoint = Endpoint::bind(address)
-            .await
-            .expect("daemon binds its endpoint");
+        // Not `expect`. A bind that fails here is the symptom of the known
+        // intermittent, and an `expect` reports the outcome while discarding the
+        // only record of how the address got into that state.
+        let endpoint = Endpoint::bind(address).await.unwrap_or_else(|err| {
+            panic!(
+                "daemon could not bind its endpoint: {err}\n\
+                 trace for {address}:\n{}\n\
+                 anomalies: {:#?}",
+                trace_for(address),
+                drain_anomalies()
+            )
+        });
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let alive = Arc::new(AtomicUsize::new(1));
         let flag = Arc::clone(&alive);
@@ -305,3 +363,45 @@ const _: () = assert!(
     "the race-amplifier feature is not enabled for the transport under test, \
      so the stress tests in this file would run without amplification"
 );
+
+#[tokio::test]
+async fn an_address_keeps_a_trace_of_its_own_lifecycle() {
+    // The instrumentation the known intermittent needs, asserted rather than
+    // assumed. Its first recurrence explained nothing, because the observer
+    // recorded one stage across every address and the bind failure reported an
+    // outcome while discarding the only record of how the address got there.
+    //
+    // What makes the trace worth having is the ordering question: whether the
+    // previous endpoint was closed before the next bind looked at the name.
+    // Neither end of that comparison existed before.
+    install_observer();
+    let address = unique_address("trace");
+
+    let daemon = RunningDaemon::start(&address).await;
+    let client = Client::new(address.clone());
+    assert_eq!(
+        client.health().await.expect("serves").status,
+        HealthStatus::Ok
+    );
+    daemon.shutdown().await;
+
+    let trace = trace_for(&address);
+    assert!(
+        trace.contains("instance_created"),
+        "no listening instance was recorded for {address}:
+{trace}"
+    );
+    // Handed off rather than completed. A socket has no per-connection listening
+    // instance, so the stages naming one are emitted on Windows only, and this is
+    // the marker both platforms use for a connection that reached a handler.
+    assert!(
+        trace.contains("connection_handed_off"),
+        "the connection that served the request was not recorded for {address}:
+{trace}"
+    );
+    assert!(
+        trace.contains("endpoint_closed"),
+        "the endpoint closing was not recorded for {address}, which is the half of          the comparison a failed rebind needs:
+{trace}"
+    );
+}
