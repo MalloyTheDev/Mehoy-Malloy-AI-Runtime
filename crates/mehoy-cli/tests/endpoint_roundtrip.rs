@@ -168,6 +168,37 @@ async fn a_second_daemon_is_refused() {
     }
 }
 
+/// A bind must wait out a name that is only on its way out.
+///
+/// Windows only, because the two platforms reach `AlreadyRunning` differently. A
+/// socket's listener is closed by the time its endpoint has dropped, so a stale
+/// path is recognised by nothing answering on it. A named pipe's name survives
+/// while any instance of it does, and an instance that is still closing answers,
+/// which is what made restarting on the same name fail intermittently.
+///
+/// The window is constructed rather than waited for: the first endpoint is held
+/// until after the second bind has started, so the second one begins while the
+/// name is genuinely taken and finishes after it is released.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_bind_waits_out_an_endpoint_that_is_only_closing() {
+    let address = unique_address("closing");
+    let first = Endpoint::bind(&address).await.expect("the first binds");
+
+    let releasing = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(first);
+    });
+
+    let second = Endpoint::bind(&address).await;
+    releasing.await.expect("the releasing task did not panic");
+
+    match second {
+        Ok(_) => {}
+        Err(err) => panic!("a bind gave up on a name that was only closing, reporting: {err}"),
+    }
+}
+
 #[tokio::test]
 async fn client_reports_not_running_when_no_daemon_is_listening() {
     let address = unique_address("absent");

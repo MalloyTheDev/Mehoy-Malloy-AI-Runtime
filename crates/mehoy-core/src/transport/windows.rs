@@ -46,6 +46,23 @@ const BIND_LINGER_BUDGET: std::time::Duration = std::time::Duration::from_secs(3
 /// How long to pause between bind attempts while a pipe name is still lingering.
 const BIND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// How long creation must keep failing, after the name has answered once, before
+/// a daemon is believed to be behind it.
+///
+/// Distinct from [`BIND_LINGER_BUDGET`], which covers a name lingering with
+/// nothing on it. This covers the opposite and less obvious case: an instance
+/// that answers because its owner's teardown has not finished. Connecting to one
+/// of those and concluding a daemon is running is how restarting on the same name
+/// fails intermittently.
+///
+/// What separates the two is not whether the name answers, it is whether the name
+/// keeps refusing to be created. A closing instance stops refusing within
+/// milliseconds; something holding the name never stops.
+///
+/// Short on purpose. Reporting a daemon that genuinely is running is the common
+/// case and should stay prompt, and a closing instance needs far less than this.
+const BIND_LIVENESS_CONFIRMATION: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Buffer sizes advertised when creating a pipe instance. These are hints to the
 /// system, not limits on message size.
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
@@ -288,6 +305,10 @@ impl Endpoint {
         let trace_address: Arc<str> = Arc::from(address.as_str());
 
         let deadline = std::time::Instant::now() + BIND_LINGER_BUDGET;
+        // When the name was first found to answer, if it ever was. Timed rather
+        // than acted on, and recorded once: the probe below is destructive, so
+        // asking twice is not free.
+        let mut answered_at: Option<std::time::Instant> = None;
         let pending = loop {
             match create_instance(address.as_str(), &sddl, true) {
                 Ok(instance) => break instance,
@@ -296,7 +317,29 @@ impl Endpoint {
                         &EndpointEvent::new(Stage::InstanceCreated, &trace_address, 0, false)
                             .with_error(&err),
                     );
-                    if ClientOptions::new().open(address.as_str()).is_ok() {
+                    // Asked once, and only once. Opening the pipe connects to a
+                    // listening instance and so consumes it, which a serving
+                    // daemon replaces and an endpoint that has bound but not yet
+                    // begun accepting does not. Probing repeatedly would make
+                    // that second, entirely legitimate state look dead.
+                    if answered_at.is_none() && ClientOptions::new().open(address.as_str()).is_ok()
+                    {
+                        answered_at = Some(std::time::Instant::now());
+                    }
+
+                    // An answer says a listening instance existed a moment ago,
+                    // which is not the same as a daemon being there: an instance
+                    // whose owner is still tearing down answers too. This branch
+                    // used to conclude `AlreadyRunning` from that single answer,
+                    // which is the whole of the intermittent restart failure. The
+                    // loop below exists for a name that outlives its owner, and
+                    // the one observation that skipped it was the one it was
+                    // written for.
+                    //
+                    // So the answer only decides which failure to report, and the
+                    // decision waits until creation has gone on failing for long
+                    // enough that a closing instance would have finished.
+                    if answered_at.is_some_and(|at| at.elapsed() >= BIND_LIVENESS_CONFIRMATION) {
                         return Err(EndpointError::AlreadyRunning {
                             address: address.clone(),
                         });
@@ -305,7 +348,7 @@ impl Endpoint {
                         return Err(EndpointError::Io(io::Error::new(
                             io::ErrorKind::AddrInUse,
                             format!(
-                                "{address} still has instances after {}s but nothing answers on it",
+                                "{address} still has instances after {}s and no daemon could be                                  confirmed on it",
                                 BIND_LINGER_BUDGET.as_secs()
                             ),
                         )));
