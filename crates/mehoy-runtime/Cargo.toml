@@ -34,7 +34,7 @@ tokio = { workspace = true, features = ["macros", "rt", "time"] }
 mehoy-core = { workspace = true, features = ["fault-injection"] }
 mehoy-runtime = { path = ".", features = ["fault-injection"] }
 tempfile = "3"
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "sync"] }
 
 [[test]]
 name = "model_classes"
@@ -58,6 +58,13 @@ required-features = ["real-backend-tests"]
 [[test]]
 name = "accounting"
 required-features = ["real-backend-tests"]
+
+# The stand-in engine. It lives here rather than beside the backend adapter it
+# imitates because `cargo test -p mehoy-runtime` builds this crate's examples and
+# not another crate's, and a test that silently runs against a stale helper
+# binary is worse than one that cannot find it at all.
+[[example]]
+name = "stand_in_backend"
 
 [lints]
 workspace = true

@@ -194,15 +194,36 @@ in it requires a model: the few targets that can use one skip, and say so, when
 no backend executable is configured, so on a machine without one the gate is
 entirely deterministic.
 
+That includes the whole lifecycle. A stand-in backend, built from this workspace
+by `cargo test`, answers the adapter's requests with responses of the right shape
+and no meaning, and a container is twelve metadata entries written to a temporary
+file. Between them, loading, admission, the resource ledger, instance ownership
+and unload draining are exercised on any machine, with failure modes requested
+through the container's file name:
+
+```text
+fixture__never-ready.gguf         the backend never binds
+fixture__refuse-credential.gguf   it binds and rejects the credential
+fixture__fail-load.gguf           it refuses the container and exits
+fixture__exit-after-serving-50.gguf  it answers one request, then abandons the instance
+```
+
+What the stand-in cannot do is verify a capability. Only performing a task
+demonstrates one, so no test using it may promote a capability, and a test
+asserts that none does.
+
 The real-backend gate covers what a particular engine build actually does: that a
 model loads and generates, and that stopping a request stops the work rather than
 merely stopping the output. Those are properties of that engine rather than of this
-code, which is why they are opt-in. It also holds the tests about this runtime's
-own behaviour that need a real model in order to have something to be about, such
-as ownership and resource accounting; the policy those enforce is unit-tested in
-the default gate, and only the joining of it to an actual load lives here. The
-test targets are not built without their feature, so they cost the default gate
-nothing.
+code, which is why they are opt-in. It also holds the tests that only a real
+model can answer: that a capability is genuinely demonstrated rather than merely
+shaped, and that figures like a container's size describe something that was
+actually loaded. The test targets are not built without their feature, so they
+cost the default gate nothing.
+
+The division is about what each gate can honestly prove, not about convenience.
+A stand-in can show that this runtime admits, accounts for and tears down a
+model correctly. It cannot show that a model embeds, because it does not embed.
 
 ```bash
 MEHOY_LLAMA_SERVER=/path/to/llama-server cargo test --workspace \
