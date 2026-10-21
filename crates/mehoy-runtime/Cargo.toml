@@ -29,6 +29,9 @@ getrandom = "0.4"
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [dev-dependencies]
+# The runtime's own fault, and the core fault that makes a refused kill
+# reachable so a failed teardown can be exercised rather than argued about.
+mehoy-core = { workspace = true, features = ["fault-injection"] }
 mehoy-runtime = { path = ".", features = ["fault-injection"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }

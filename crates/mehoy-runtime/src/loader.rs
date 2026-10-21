@@ -299,6 +299,15 @@ pub enum UnloadOutcome {
     AlreadyUnloading,
     /// This instance had already been unloaded.
     AlreadyUnloaded,
+    /// A previous teardown failed, and there is nothing left to retry with.
+    ///
+    /// That attempt took the worker out of the lifecycle and could not stop it,
+    /// so no handle to the process remains and a second attempt can establish
+    /// nothing. Reported as its own outcome rather than as success, because the
+    /// instance keeps its accounted footprint: nothing has shown that its worker
+    /// is gone, and handing that budget to another model is the more dangerous of
+    /// the two wrong answers. See ADR-0010 decision 6.
+    AlreadyFailed,
 }
 
 impl fmt::Display for UnloadOutcome {
@@ -316,6 +325,10 @@ impl fmt::Display for UnloadOutcome {
             ),
             Self::AlreadyUnloading => f.write_str("an unload was already in progress"),
             Self::AlreadyUnloaded => f.write_str("the instance was already unloaded"),
+            Self::AlreadyFailed => f.write_str(
+                "an earlier teardown failed and cannot be retried; \
+                 the worker it could not stop is unaccounted for",
+            ),
         }
     }
 }
@@ -685,7 +698,14 @@ impl LoadedModel {
             match lifecycle.phase {
                 LifecyclePhase::Unloading => return Ok(UnloadOutcome::AlreadyUnloading),
                 LifecyclePhase::Unloaded => return Ok(UnloadOutcome::AlreadyUnloaded),
-                LifecyclePhase::UnloadFailed | LifecyclePhase::Serving => {}
+                // Terminal, deliberately. The attempt that failed took the worker
+                // and could not stop it, so nothing here can try again and
+                // nothing here can learn whether it is gone. Falling through used
+                // to find the worker already taken and report the instance
+                // unloaded, which released an accounted footprint on the strength
+                // of no evidence at all.
+                LifecyclePhase::UnloadFailed => return Ok(UnloadOutcome::AlreadyFailed),
+                LifecyclePhase::Serving => {}
             }
             lifecycle.phase = LifecyclePhase::Unloading;
             let outstanding: Vec<RequestHandle> = lifecycle
@@ -698,10 +718,15 @@ impl LoadedModel {
         };
 
         let Some(worker) = worker.take() else {
-            // Admission was closed by a previous attempt that then failed. There
-            // is no worker left to stop, so finish the bookkeeping.
-            self.finish(LifecyclePhase::Unloaded);
-            return Ok(UnloadOutcome::AlreadyUnloaded);
+            // Unreachable: a serving instance always holds its worker, this is the
+            // only code that takes it, and the phase gate above no longer falls
+            // through for an instance whose teardown already failed.
+            //
+            // Recorded as failed rather than unloaded anyway, because an instance
+            // with no worker and no record of one having stopped is exactly the
+            // state that must not be reported as released.
+            self.finish(LifecyclePhase::UnloadFailed);
+            return Ok(UnloadOutcome::AlreadyFailed);
         };
 
         // Phase two, with the lock released: stopping requests, waiting for them,
