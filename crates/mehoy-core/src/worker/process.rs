@@ -566,7 +566,13 @@ impl ProcessWorker {
     }
 
     /// Kills the worker without asking.
+    ///
+    /// A refused kill is reported, and reported promptly. The reporting exists so
+    /// a caller can learn that an accelerator may still be held, and a report
+    /// that arrives only once the worker has gone anyway tells them nothing they
+    /// could have acted on.
     async fn terminate(&self, handle: &mut WorkerHandle) -> Result<(), WorkerError> {
+        let budget = handle.deadlines.shutdown;
         let mut refused = None;
         if let Some(child) = handle.child.as_mut() {
             // A worker that has already exited needs no killing, and signalling one
@@ -578,25 +584,103 @@ impl ProcessWorker {
                 // that could not be killed be described as stopped, which is the
                 // more dangerous of the two wrong answers: the caller believes the
                 // accelerator has been released.
-                if let Err(err) = child.start_kill() {
-                    // It may simply have exited in the interval. That is not a
-                    // failure to stop it, so the claim is checked before it is made.
-                    if !matches!(child.try_wait(), Ok(Some(_))) {
-                        refused = Some(err);
+                match injected_kill_refusal() {
+                    // Injected refusals do not signal the process at all, because
+                    // a refusal whose process then dies is not the case under test.
+                    Some(injected) => refused = Some(injected),
+                    None => {
+                        if let Err(err) = child.start_kill() {
+                            // It may simply have exited in the interval. That is
+                            // not a failure to stop it, so the claim is checked
+                            // before it is made.
+                            if !matches!(child.try_wait(), Ok(Some(_))) {
+                                refused = Some(err);
+                            }
+                        }
                     }
                 }
             }
-            // The wait is never reported. Losing a race to reap a process that has
-            // already exited is ordinary, and says nothing about whether it is gone.
-            let _ = child.wait().await;
-            handle.child = None;
+
+            // Worth knowing for both branches: `Child::wait` drops the child's
+            // stdin before waiting, so a worker that stops on end of input will
+            // exit here for that reason rather than because it was signalled.
+            if refused.is_some() {
+                // The process is still running and nothing here is going to change
+                // that, so waiting on it is waiting for an unrelated event. The
+                // wait is bounded, and the child is deliberately kept: the handle
+                // still has something in it, and dropping the handle gets one
+                // further attempt through kill-on-drop.
+                if matches!(tokio::time::timeout(budget, child.wait()).await, Ok(Ok(_))) {
+                    // It ended anyway, so the refusal described a moment that has
+                    // passed and the worker is genuinely gone.
+                    refused = None;
+                    handle.child = None;
+                }
+            } else {
+                // A signalled process exits promptly, so this wait is what makes
+                // its final output complete rather than something that can stall.
+                // Losing a race to reap a process that has already exited is
+                // ordinary, and says nothing about whether it is gone.
+                let _ = child.wait().await;
+                handle.child = None;
+            }
         }
+        // Already bounded per stream, so a worker that is still holding its pipes
+        // open delays this by a fixed amount rather than indefinitely.
         handle.flush_output().await;
         match refused {
             Some(err) => Err(WorkerError::Io(err)),
             None => Ok(()),
         }
     }
+}
+
+/// A refused kill the tests asked for, so the unstoppable-worker path is
+/// reachable.
+///
+/// The operating system refuses to signal a live process only in circumstances a
+/// test cannot arrange, so without this the branch that reports a worker as
+/// unstoppable is unreachable and therefore untested. That matters more than
+/// usual here, because everything above it treats "could not be stopped" as the
+/// answer it must not get wrong.
+///
+/// The flag is process-wide, so a test that arms it must not run concurrently
+/// with another that stops a worker, or one will consume the other's refusal.
+#[cfg(feature = "fault-injection")]
+pub mod fault {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REFUSE_KILL: AtomicBool = AtomicBool::new(false);
+
+    /// Makes the next termination behave as though the system refused to kill the
+    /// worker, leaving it running.
+    pub fn refuse_next_kill() {
+        REFUSE_KILL.store(true, Ordering::SeqCst);
+    }
+
+    /// Clears any pending injected refusal.
+    pub fn clear() {
+        REFUSE_KILL.store(false, Ordering::SeqCst);
+    }
+
+    pub(super) fn take() -> bool {
+        REFUSE_KILL.swap(false, Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+fn injected_kill_refusal() -> Option<std::io::Error> {
+    fault::take().then(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected refusal to kill the worker",
+        )
+    })
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn injected_kill_refusal() -> Option<std::io::Error> {
+    None
 }
 
 /// Requests that the child be reaped if this process dies.

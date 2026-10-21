@@ -24,3 +24,6 @@ pub use inference::{
 };
 pub use transport::{ClientStream, Endpoint, EndpointAddress, EndpointError, Stream};
 pub use worker::{ProcessWorker, WorkerHandle, WorkerSpec, WorkerState};
+
+#[cfg(feature = "fault-injection")]
+pub use worker::{clear_injected_faults, refuse_next_kill};

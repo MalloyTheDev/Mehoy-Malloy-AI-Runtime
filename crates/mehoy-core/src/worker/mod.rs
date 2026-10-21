@@ -20,6 +20,9 @@ pub use log::{LogHandle, LogLine, LogStream, WorkerLog};
 pub use process::{ProbeOutcome, ProcessWorker, WorkerHandle};
 pub use state::{WorkerState, WorkerStateError};
 
+#[cfg(feature = "fault-injection")]
+pub use process::fault::{clear as clear_injected_faults, refuse_next_kill};
+
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;

@@ -14,6 +14,12 @@ authors.workspace = true
 # defects surface in tests instead of in production.
 race-amplifier = []
 
+# Test-only. Allows a refused kill to be injected, so the path where a worker
+# cannot be stopped can be exercised rather than assumed. A genuine refusal
+# needs an operating system that will not signal a live process, which is not
+# something a test can arrange.
+fault-injection = []
+
 [dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
@@ -30,7 +36,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+mehoy-core = { path = ".", features = ["fault-injection"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 
 [[example]]
 name = "dummy_worker"
