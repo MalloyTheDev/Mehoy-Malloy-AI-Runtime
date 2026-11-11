@@ -20,7 +20,8 @@ pub use event::{ExitCause, InferenceEvent, RuntimeEvent};
 pub use id::{IdAllocator, ModelId, RequestId, WorkerId};
 pub use inference::{
     EmbedRequest, Embedding, EmbeddingResult, FinishReason, GenerateTextRequest,
-    GenerationParameters, GenerationResult, GenerationUsage, Task, TaskId, TextInput,
+    GenerationParameters, GenerationResult, GenerationUsage, InvalidRequest, Task, TaskId,
+    TextInput,
 };
 pub use transport::{ClientStream, Endpoint, EndpointAddress, EndpointError, Stream};
 pub use worker::{ProcessWorker, WorkerHandle, WorkerSpec, WorkerState};

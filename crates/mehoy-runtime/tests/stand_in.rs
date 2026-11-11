@@ -21,7 +21,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mehoy_core::inference::{EmbedRequest, GenerateTextRequest, GenerationParameters};
+use mehoy_core::inference::{
+    EmbedRequest, GenerateTextRequest, GenerationParameters, MAX_INPUT_BYTES,
+};
 use mehoy_runtime::{
     DEFAULT_RESIDENT_CAPACITY, FootprintBasis, InstanceId, LifecyclePhase, LoadError,
     ModelCapability, ResidentLimits, ResidentUsage, RuntimeError,
@@ -93,6 +95,66 @@ async fn a_model_loads_serves_and_unloads_with_nothing_installed() {
     runtime.unload(&id).await.expect("unloads");
     assert_eq!(runtime.usage(), ResidentUsage::default());
     assert!(runtime.instance(&id).is_none());
+}
+
+#[tokio::test]
+async fn an_invalid_embedding_is_refused_before_it_reaches_the_backend() {
+    let runtime = stand_in_runtime();
+    let held = fixture(Some("exit-after-serving-0"));
+    let id = runtime
+        .load(
+            &held.registry,
+            &held.artifact,
+            worker_id(),
+            stand_in_deadlines(),
+        )
+        .await
+        .expect("loads");
+
+    let oversized = EmbedRequest::single("x".repeat(MAX_INPUT_BYTES + 1));
+    assert!(matches!(
+        runtime.embed(&id, &oversized).await,
+        Err(RuntimeError::Instance(LoadError::InvalidRequest { .. }))
+    ));
+
+    // The stand-in exits immediately after its first real inference request. If
+    // the invalid embedding reached it, this valid request would fail instead.
+    runtime
+        .generate_text(&id, &short_request())
+        .await
+        .expect("the invalid request did not reach the backend");
+
+    runtime.unload(&id).await.expect("unloads");
+}
+
+#[tokio::test]
+async fn an_oversized_prompt_is_refused_before_it_reaches_the_backend() {
+    let runtime = stand_in_runtime();
+    let held = fixture(Some("exit-after-serving-0"));
+    let id = runtime
+        .load(
+            &held.registry,
+            &held.artifact,
+            worker_id(),
+            stand_in_deadlines(),
+        )
+        .await
+        .expect("loads");
+
+    let oversized = GenerateTextRequest::continuation("x".repeat(MAX_INPUT_BYTES + 1));
+    assert!(matches!(
+        runtime.generate_text(&id, &oversized).await,
+        Err(RuntimeError::Instance(LoadError::InvalidRequest { .. }))
+    ));
+
+    // The stand-in exits immediately after its first real inference request. If
+    // the invalid prompt reached it, this valid request would fail instead.
+    runtime
+        .generate_text(&id, &short_request())
+        .await
+        .expect("the invalid prompt did not reach the backend");
+
+    runtime.unload(&id).await.expect("unloads");
 }
 
 #[tokio::test]
