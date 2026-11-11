@@ -108,6 +108,39 @@ impl EmbedRequest {
     pub fn is_empty(&self) -> bool {
         self.inputs.is_empty()
     }
+
+    /// Checks that the request can be admitted without an unbounded allocation.
+    ///
+    /// The limits are deliberately independent of a model's context length. This
+    /// layer does not have a tokenizer or a backend-specific context contract, so
+    /// these are portable guards against accidentally absurd requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first batch or input-size limit that the request exceeds.
+    pub fn validate(&self) -> Result<(), InvalidRequest> {
+        if self.inputs.len() > MAX_EMBED_BATCH_SIZE {
+            return Err(InvalidRequest::Embedding {
+                reason: format!(
+                    "{} inputs exceeds the limit of {MAX_EMBED_BATCH_SIZE}",
+                    self.inputs.len()
+                ),
+            });
+        }
+
+        for (index, input) in self.inputs.iter().enumerate() {
+            if input.len() > MAX_INPUT_BYTES {
+                return Err(InvalidRequest::Embedding {
+                    reason: format!(
+                        "input {index} is {} bytes, exceeding the limit of {MAX_INPUT_BYTES}",
+                        input.len()
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// One embedding, tied to the input it came from.
@@ -292,7 +325,33 @@ impl TextInput {
             Self::Continuation(text) => text,
         }
     }
+
+    /// Checks the portable input-size guard.
+    ///
+    /// This is a byte limit rather than a token limit because tokenisation belongs
+    /// to the backend and is not available at the runtime boundary.
+    pub fn validate(&self) -> Result<(), InvalidRequest> {
+        if self.as_str().len() > MAX_INPUT_BYTES {
+            return Err(InvalidRequest::Input {
+                reason: format!(
+                    "input is {} bytes, exceeding the limit of {MAX_INPUT_BYTES}",
+                    self.as_str().len()
+                ),
+            });
+        }
+
+        Ok(())
+    }
 }
+
+/// The largest input accepted by a text or embedding request, in UTF-8 bytes.
+///
+/// This is an admission guard against accidental or hostile oversized requests,
+/// not a model context-length check.
+pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+
+/// The most inputs accepted by one embedding request.
+pub const MAX_EMBED_BATCH_SIZE: usize = 128;
 
 /// The most stop sequences a request may carry.
 pub const MAX_STOP_SEQUENCES: usize = 8;
@@ -437,7 +496,38 @@ impl GenerateTextRequest {
         self.parameters = parameters;
         self
     }
+
+    /// Checks the input and portable generation parameters before admission.
+    pub fn validate(&self) -> Result<(), InvalidRequest> {
+        self.input.validate()?;
+        self.parameters
+            .validate()
+            .map_err(InvalidRequest::GenerationParameter)
+    }
 }
+
+/// Why a caller's inference request cannot be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidRequest {
+    /// A text input exceeded the portable byte guard.
+    Input { reason: String },
+    /// An embedding batch or one of its inputs exceeded a portable guard.
+    Embedding { reason: String },
+    /// A generation parameter could not be honoured.
+    GenerationParameter(InvalidGenerationParameter),
+}
+
+impl fmt::Display for InvalidRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input { reason } => write!(f, "input is invalid: {reason}"),
+            Self::Embedding { reason } => write!(f, "embedding request is invalid: {reason}"),
+            Self::GenerationParameter(parameter) => parameter.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for InvalidRequest {}
 
 /// Why generation stopped.
 ///
@@ -1263,6 +1353,41 @@ mod tests {
         assert!(matches!(
             too_large.validate(),
             Err(InvalidGenerationParameter::StopSequences { .. })
+        ));
+    }
+
+    #[test]
+    fn request_limits_accept_exact_boundaries() {
+        assert!(
+            TextInput::Continuation("x".repeat(MAX_INPUT_BYTES))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            EmbedRequest::single("x".repeat(MAX_INPUT_BYTES))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            EmbedRequest::batch(std::iter::repeat_n("x", MAX_EMBED_BATCH_SIZE))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_limits_reject_one_over_the_boundary() {
+        assert!(matches!(
+            TextInput::Continuation("x".repeat(MAX_INPUT_BYTES + 1)).validate(),
+            Err(InvalidRequest::Input { .. })
+        ));
+        assert!(matches!(
+            EmbedRequest::single("x".repeat(MAX_INPUT_BYTES + 1)).validate(),
+            Err(InvalidRequest::Embedding { .. })
+        ));
+        assert!(matches!(
+            EmbedRequest::batch(std::iter::repeat_n("x", MAX_EMBED_BATCH_SIZE + 1)).validate(),
+            Err(InvalidRequest::Embedding { .. })
         ));
     }
 

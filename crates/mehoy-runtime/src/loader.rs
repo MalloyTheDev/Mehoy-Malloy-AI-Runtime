@@ -409,10 +409,18 @@ impl LoadedModel {
     ///
     /// # Errors
     ///
-    /// Returns [`LoadError::NotUsable`] when the instance is not ready,
+    /// Returns [`LoadError::InvalidRequest`] when the request is too large,
+    /// [`LoadError::NotUsable`] when the instance is not ready,
     /// [`LoadError::Inference`] when the backend refuses, and
     /// [`LoadError::UnusableResult`] when the response is structurally wrong.
     pub async fn embed(&self, request: &EmbedRequest) -> Result<EmbeddingResult, LoadError> {
+        // Validated before admission, so an unusable request never occupies one.
+        request
+            .validate()
+            .map_err(|invalid| LoadError::InvalidRequest {
+                detail: invalid.to_string(),
+            })?;
+
         let handle = self.admit()?;
         handle.mark_running();
 
@@ -486,7 +494,6 @@ impl LoadedModel {
     ) -> Result<GenerationResult, LoadError> {
         // Validated before admission, so an unusable request never occupies one.
         request
-            .parameters
             .validate()
             .map_err(|invalid| LoadError::InvalidRequest {
                 detail: invalid.to_string(),
@@ -563,7 +570,6 @@ impl LoadedModel {
     ) -> Result<GenerationRequest, LoadError> {
         // Validated before admission, so an unusable request never occupies one.
         request
-            .parameters
             .validate()
             .map_err(|invalid| LoadError::InvalidRequest {
                 detail: invalid.to_string(),
